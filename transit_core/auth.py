@@ -44,9 +44,9 @@ def _set_token_json(key: str, token: dict) -> None:
     rows = ws.get_all_records()
     token_str = json.dumps(token)
 
-    for i, r in enumerate(rows, start=2):
+    for idx, r in enumerate(rows, start=2):
         if str(r.get("key", "")).strip() == key:
-            ws.update(f"B{i}", [[token_str]])
+            ws.update(f"B{idx}", [[token_str]])
             return
 
     ws.append_row([key, token_str])
@@ -59,7 +59,7 @@ def _get_query_params() -> dict:
         return st.experimental_get_query_params()
 
 
-def _clear_query_params():
+def _clear_query_params() -> None:
     try:
         st.query_params.clear()
     except Exception:
@@ -72,11 +72,6 @@ def drive_oauth_ready_ui() -> bool:
         return True
 
     st.warning("Drive OAuth no está conectado. Conecta tu Google Drive para poder subir documentos.")
-    st.write("DEBUG redirect_uri usado:", redirect_uri)
-    st.write("DEBUG redirect_uri:", st.secrets["google_oauth"]["redirect_uri"])
-st.write("DEBUG client_id:", st.secrets["google_oauth"]["client_id"])
-
-
 
     client_id = st.secrets["google_oauth"]["client_id"]
     client_secret = st.secrets["google_oauth"]["client_secret"]
@@ -97,7 +92,6 @@ st.write("DEBUG client_id:", st.secrets["google_oauth"]["client_id"])
 
     qp = _get_query_params()
     code = qp.get("code")
-
     if isinstance(code, list):
         code = code[0] if code else None
 
@@ -105,7 +99,6 @@ st.write("DEBUG client_id:", st.secrets["google_oauth"]["client_id"])
         try:
             flow.fetch_token(code=code)
             creds = flow.credentials
-
             token_payload = {
                 "token": creds.token,
                 "refresh_token": creds.refresh_token,
@@ -114,13 +107,10 @@ st.write("DEBUG client_id:", st.secrets["google_oauth"]["client_id"])
                 "client_secret": creds.client_secret,
                 "scopes": creds.scopes,
             }
-
             _set_token_json("drive_token", token_payload)
             _clear_query_params()
-
             st.success("✅ Drive conectado.")
             st.rerun()
-
         except Exception as e:
             st.error(f"No pude completar OAuth: {type(e).__name__}: {e}")
             return False
@@ -130,7 +120,6 @@ st.write("DEBUG client_id:", st.secrets["google_oauth"]["client_id"])
         include_granted_scopes="true",
         prompt="consent",
     )
-
     st.link_button("Conectar Google Drive", auth_url)
     st.caption("Después de autorizar, Google te regresará a esta app y se guardará el token.")
     return False
@@ -150,10 +139,9 @@ def get_drive_user_credentials() -> UserCredentials:
         scopes=token.get("scopes"),
     )
 
-    if not creds.valid:
-        if creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-            token["token"] = creds.token
-            _set_token_json("drive_token", token)
+    if not creds.valid and creds.refresh_token and creds.expired:
+        creds.refresh(Request())
+        token["token"] = creds.token
+        _set_token_json("drive_token", token)
 
     return creds
