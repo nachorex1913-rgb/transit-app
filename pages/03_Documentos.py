@@ -5,6 +5,10 @@ from transit_core.gsheets_db import list_cases, get_case, add_document, list_doc
 from transit_core.gdrive_storage import upload_file, debug_folder
 
 st.title("Documentos")
+from transit_core.auth import drive_oauth_ready_ui
+
+if not drive_oauth_ready_ui():
+    st.stop()
 
 cases = list_cases()
 if cases.empty:
