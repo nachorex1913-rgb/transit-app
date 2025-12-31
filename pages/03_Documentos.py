@@ -2,7 +2,7 @@ import streamlit as st
 from googleapiclient.errors import HttpError
 
 from transit_core.gsheets_db import list_cases, get_case, add_document, list_documents
-from transit_core.gdrive_storage import upload_file
+from transit_core.gdrive_storage import upload_file, debug_folder
 
 st.title("Documentos")
 
@@ -16,12 +16,20 @@ case = get_case(case_id)
 if not case:
     st.stop()
 
-if not case.get("drive_folder_id"):
+folder_id = case.get("drive_folder_id")
+if not folder_id:
     st.error("Este trámite aún no tiene carpeta en Drive. Ve a Trámites y créala.")
     st.stop()
 
-doc_type = st.selectbox("Tipo de documento", ["title", "invoice", "pedimento", "photo", "other"])
+with st.expander("Debug Drive (para ver permisos/capabilities)", expanded=False):
+    st.write("drive_folder_id:", folder_id)
+    try:
+        st.write(debug_folder(folder_id))
+    except HttpError as e:
+        st.error(f"No pude leer metadata del folder. HttpError {e.resp.status}")
+        st.text(e.content.decode("utf-8", errors="ignore"))
 
+doc_type = st.selectbox("Tipo de documento", ["title", "invoice", "pedimento", "photo", "other"])
 subfolder = {
     "title": "02_Vehiculos",
     "invoice": "01_Docs_Cliente",
@@ -35,16 +43,13 @@ file = st.file_uploader("Subir archivo", type=None)
 if file and st.button("Subir a Drive"):
     file_bytes = file.read()
     try:
-        drive_id = upload_file(case["drive_folder_id"], file_bytes, file.name, subfolder)
-        add_document(
-            case_id=case_id,
-            drive_file_id=drive_id,
-            file_name=file.name,
-            doc_type=doc_type
-        )
+        drive_id = upload_file(folder_id, file_bytes, file.name, subfolder)
+        add_document(case_id=case_id, drive_file_id=drive_id, file_name=file.name, doc_type=doc_type)
         st.success("Documento subido y registrado.")
     except HttpError as e:
-        st.error(f"Drive HttpError (status {e.resp.status}). Reintenta. Si persiste, revisa permisos.")
+        st.error(f"Drive HttpError (status {e.resp.status}).")
+        # Esto muestra el motivo REAL (insufficientFilePermissions, cannotAddChildren, etc.)
+        st.text(e.content.decode("utf-8", errors="ignore"))
 
 st.divider()
 st.subheader("Documentos registrados")
