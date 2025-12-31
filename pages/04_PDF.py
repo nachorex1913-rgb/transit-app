@@ -14,6 +14,13 @@ case = get_case(case_id)
 if not case:
     st.stop()
 
+try:
+    cases = list_cases()
+except Exception as e:
+    st.error(f"Sheets temporal: {e}")
+    st.stop()
+
+
 clients = list_clients()
 client = clients[clients["client_id"] == case["client_id"]].iloc[0].to_dict()
 
