@@ -1,15 +1,9 @@
 import streamlit as st
-from googleapiclient.errors import HttpError
 
-from transit_core.auth import drive_oauth_ready_ui
 from transit_core.gsheets_db import list_cases, get_case, add_document, list_documents
-from transit_core.gdrive_storage import upload_file
+from transit_core.drive_bridge import upload_to_drive_via_script
 
-st.title("Documentos (simple)")
-
-# Conectar Drive (OAuth)
-if not drive_oauth_ready_ui():
-    st.stop()
+st.title("Documentos")
 
 cases = list_cases()
 if cases.empty:
@@ -26,17 +20,23 @@ if not folder_id:
     st.error("Este trámite aún no tiene carpeta en Drive. Ve a Trámites y créala.")
     st.stop()
 
+doc_type = st.selectbox("Tipo de documento", ["title", "invoice", "pedimento", "photo", "other"])
+
 file = st.file_uploader("Subir archivo", type=None)
 
 if file and st.button("Subir a Drive"):
     try:
         file_bytes = file.read()
-        drive_id = upload_file(folder_id, file_bytes, file.name, subfolder_key="")  # subfolder vacío
-        add_document(case_id=case_id, drive_file_id=drive_id, file_name=file.name, doc_type="other")
+        drive_id = upload_to_drive_via_script(
+            folder_id=folder_id,
+            file_name=file.name,
+            mime_type=file.type or "application/octet-stream",
+            file_bytes=file_bytes,
+        )
+        add_document(case_id=case_id, drive_file_id=drive_id, file_name=file.name, doc_type=doc_type)
         st.success("✅ Documento subido y registrado.")
-    except HttpError as e:
-        st.error(f"Drive HttpError (status {e.resp.status}).")
-        st.text(e.content.decode("utf-8", errors="ignore"))
+    except Exception as e:
+        st.error(f"No se pudo subir: {type(e).__name__}: {e}")
 
 st.divider()
 st.subheader("Documentos registrados")
