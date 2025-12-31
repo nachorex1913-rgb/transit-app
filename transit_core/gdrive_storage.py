@@ -1,12 +1,14 @@
 # transit_core/gdrive_storage.py
 from __future__ import annotations
-from datetime import datetime
 from typing import Optional
+import time
+import random
 
 import streamlit as st
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaInMemoryUpload
+from googleapiclient.errors import HttpError
 
 from .ids import normalize_name_for_folder
 
@@ -31,15 +33,21 @@ def create_case_folder(case_id: str, client_name: str, case_date: str) -> str:
     folder_name = f"{case_date}_{case_id}_{safe_name}"
 
     service = _drive()
+
     metadata = {
         "name": folder_name,
         "mimeType": "application/vnd.google-apps.folder",
         "parents": [root_id],
     }
-    folder = service.files().create(body=metadata, fields="id").execute()
+
+    folder = service.files().create(
+        body=metadata,
+        fields="id",
+        supportsAllDrives=True,
+    ).execute()
     folder_id = folder["id"]
 
-    # create subfolders
+    # Crear subcarpetas
     for sf in SUBFOLDERS.values():
         service.files().create(
             body={
@@ -47,7 +55,8 @@ def create_case_folder(case_id: str, client_name: str, case_date: str) -> str:
                 "mimeType": "application/vnd.google-apps.folder",
                 "parents": [folder_id],
             },
-            fields="id"
+            fields="id",
+            supportsAllDrives=True,
         ).execute()
 
     return folder_id
@@ -59,20 +68,20 @@ def _find_child_folder(parent_id: str, name: str) -> Optional[str]:
         f"mimeType='application/vnd.google-apps.folder' and "
         f"name='{name}' and trashed=false"
     )
+
     res = service.files().list(
-    q=q,
-    fields="files(id,name)",
-    supportsAllDrives=True,
-    includeItemsFromAllDrives=True,
-).execute()
+        q=q,
+        fields="files(id,name)",
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute()
 
-
-import time
-import random
-from googleapiclient.errors import HttpError
+    files = res.get("files", [])
+    return files[0]["id"] if files else None
 
 def upload_file(case_folder_id: str, file_bytes: bytes, filename: str, subfolder_key: str) -> str:
     service = _drive()
+
     sub_name = SUBFOLDERS.get(subfolder_key, subfolder_key)
     sub_id = _find_child_folder(case_folder_id, sub_name) or case_folder_id
 
@@ -92,11 +101,13 @@ def upload_file(case_folder_id: str, file_bytes: bytes, filename: str, subfolder
         except HttpError as e:
             last_err = e
             status = getattr(e.resp, "status", None)
-            # retry solo para errores temporales típicos
+
+            # Retry para errores temporales
             if status in (429, 500, 502, 503, 504):
                 time.sleep(min((2 ** attempt) + random.uniform(0, 0.5), 10))
                 continue
+
+            # 403 es permisos / destino inválido
             raise
+
     raise last_err
-
-
