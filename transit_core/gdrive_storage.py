@@ -1,52 +1,99 @@
+# transit_core/gdrive_storage.py
+from __future__ import annotations
+from typing import Optional
+import time
+import random
+
 import streamlit as st
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaInMemoryUpload
 from googleapiclient.errors import HttpError
 
-from transit_core.auth import drive_oauth_ready_ui
-from transit_core.gsheets_db import list_cases, get_case, add_document, list_documents
-from transit_core.gdrive_storage import upload_file
+from .ids import normalize_name_for_folder
+from .auth import get_drive_user_credentials
 
-st.title("Documentos")
+@st.cache_resource
+def _drive():
+    creds = get_drive_user_credentials()
+    return build("drive", "v3", credentials=creds)
 
-# Gate: obliga a conectar Drive primero
-if not drive_oauth_ready_ui():
-    st.stop()
+SUBFOLDERS = {
+    "01_Docs_Cliente": "01_Docs_Cliente",
+    "02_Vehiculos": "02_Vehiculos",
+    "03_Articulos": "03_Articulos",
+    "04_Pedimentos": "04_Pedimentos",
+    "05_PDF_Final": "05_PDF_Final",
+}
 
-cases = list_cases()
-if cases.empty:
-    st.warning("No hay trámites aún.")
-    st.stop()
+def create_case_folder(case_id: str, client_name: str, case_date: str) -> str:
+    root_id = st.secrets["DRIVE_ROOT_FOLDER_ID"]
+    safe_name = normalize_name_for_folder(client_name)
+    folder_name = f"{case_date}_{case_id}_{safe_name}"
 
-case_id = st.selectbox("Trámite", cases["case_id"].tolist())
-case = get_case(case_id)
-if not case:
-    st.stop()
+    service = _drive()
+    folder = service.files().create(
+        body={
+            "name": folder_name,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [root_id],
+        },
+        fields="id",
+        supportsAllDrives=True,
+    ).execute()
+    folder_id = folder["id"]
 
-if not case.get("drive_folder_id"):
-    st.error("Este trámite aún no tiene carpeta en Drive. Ve a Trámites y créala.")
-    st.stop()
+    for sf in SUBFOLDERS.values():
+        service.files().create(
+            body={
+                "name": sf,
+                "mimeType": "application/vnd.google-apps.folder",
+                "parents": [folder_id],
+            },
+            fields="id",
+            supportsAllDrives=True,
+        ).execute()
 
-doc_type = st.selectbox("Tipo de documento", ["title", "invoice", "pedimento", "photo", "other"])
-subfolder = {
-    "title": "02_Vehiculos",
-    "invoice": "01_Docs_Cliente",
-    "pedimento": "04_Pedimentos",
-    "photo": "02_Vehiculos",
-    "other": "01_Docs_Cliente",
-}[doc_type]
+    return folder_id
 
-file = st.file_uploader("Subir archivo", type=None)
+def _find_child_folder(parent_id: str, name: str) -> Optional[str]:
+    service = _drive()
+    q = (
+        f"'{parent_id}' in parents and "
+        f"mimeType='application/vnd.google-apps.folder' and "
+        f"name='{name}' and trashed=false"
+    )
+    res = service.files().list(
+        q=q,
+        fields="files(id,name)",
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute()
+    files = res.get("files", [])
+    return files[0]["id"] if files else None
 
-if file and st.button("Subir a Drive"):
-    file_bytes = file.read()
-    try:
-        drive_id = upload_file(case["drive_folder_id"], file_bytes, file.name, subfolder)
-        add_document(case_id=case_id, drive_file_id=drive_id, file_name=file.name, doc_type=doc_type)
-        st.success("Documento subido y registrado.")
-    except HttpError as e:
-        st.error(f"Drive HttpError (status {e.resp.status}).")
-        st.text(e.content.decode("utf-8", errors="ignore"))
+def upload_file(case_folder_id: str, file_bytes: bytes, filename: str, subfolder_key: str) -> str:
+    service = _drive()
+    sub_name = SUBFOLDERS.get(subfolder_key, subfolder_key)
+    sub_id = _find_child_folder(case_folder_id, sub_name) or case_folder_id
 
-st.divider()
-st.subheader("Documentos registrados")
-docs = list_documents(case_id)
-st.dataframe(docs, use_container_width=True)
+    media = MediaInMemoryUpload(file_bytes, resumable=False)
+    metadata = {"name": filename, "parents": [sub_id]}
+
+    last_err = None
+    for attempt in range(6):
+        try:
+            f = service.files().create(
+                body=metadata,
+                media_body=media,
+                fields="id",
+                supportsAllDrives=True,
+            ).execute()
+            return f["id"]
+        except HttpError as e:
+            last_err = e
+            status = getattr(e.resp, "status", None)
+            if status in (429, 500, 502, 503, 504):
+                time.sleep(min((2 ** attempt) + random.uniform(0, 0.5), 10))
+                continue
+            raise
+    raise last_err
