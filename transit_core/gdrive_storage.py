@@ -59,9 +59,13 @@ def _find_child_folder(parent_id: str, name: str) -> Optional[str]:
         f"mimeType='application/vnd.google-apps.folder' and "
         f"name='{name}' and trashed=false"
     )
-    res = service.files().list(q=q, fields="files(id,name)").execute()
-    files = res.get("files", [])
-    return files[0]["id"] if files else None
+    res = service.files().list(
+    q=q,
+    fields="files(id,name)",
+    supportsAllDrives=True,
+    includeItemsFromAllDrives=True,
+).execute()
+
 
 def upload_file(case_folder_id: str, file_bytes: bytes, filename: str, subfolder_key: str) -> str:
     service = _drive()
