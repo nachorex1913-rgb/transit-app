@@ -66,6 +66,9 @@ def _clear_query_params():
 
 
 def drive_oauth_ready_ui() -> bool:
+    st.write("DEBUG URL query params:", _get_query_params())
+st.write("DEBUG redirect_uri:", st.secrets["google_oauth"]["redirect_uri"])
+
     """
     UI para autorizar Drive por OAuth (una sola vez).
     Devuelve True si ya hay token guardado y listo.
