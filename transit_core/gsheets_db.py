@@ -241,6 +241,7 @@ def create_case(
     notes: str = "",
     case_date: Optional[str] = None,
     status: str = DEFAULT_STATUS,
+    drive_folder_id: str = "",
 ) -> str:
     init_db()
     ws = _ws("cases")
@@ -248,11 +249,17 @@ def create_case(
     existing_ids = [r.get("case_id","") for r in records]
     year = datetime.now().year
     case_id = next_case_id(existing_ids, year=year)
+
     now = _now_iso()
     cdate = case_date or datetime.now().date().isoformat()
-    row = [case_id, client_id, cdate, status, origin, destination, notes, "", now, now, "", ""]
+
+    row = [
+        case_id, client_id, cdate, status, origin, destination, notes,
+        drive_folder_id or "", now, now, "", ""
+    ]
     _append("cases", row)
     return case_id
+
 
 
 def get_case(case_id: str) -> dict[str, Any] | None:
