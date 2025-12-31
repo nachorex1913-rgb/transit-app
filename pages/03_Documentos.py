@@ -32,6 +32,15 @@ if file and st.button("Subir a Drive"):
     drive_id = upload_file(case["drive_folder_id"], file_bytes, file.name, subfolder)
     add_document(case_id=case_id, drive_file_id=drive_id, file_name=file.name, doc_type=doc_type)
     st.success("Documento subido y registrado.")
+    from googleapiclient.errors import HttpError
+
+try:
+    drive_id = upload_file(...)
+    add_document(...)
+    st.success("Documento subido y registrado.")
+except HttpError as e:
+    st.error(f"Drive HttpError (status {e.resp.status}). Reintenta. Si persiste, revisa permisos.")
+
 
 st.divider()
 st.subheader("Documentos registrados")
