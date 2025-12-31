@@ -31,16 +31,11 @@ def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
-def _now_iso_utc() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
-
-
 @st.cache_resource
 def _gc() -> gspread.Client:
     sa = st.secrets["gcp_service_account"]
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
-        # Nota: esto NO te da quota en MyDrive para SA, pero sí sirve para leer el sheet
         "https://www.googleapis.com/auth/drive",
     ]
     creds = Credentials.from_service_account_info(sa, scopes=scopes)
@@ -49,9 +44,6 @@ def _gc() -> gspread.Client:
 
 @st.cache_resource
 def _ss() -> gspread.Spreadsheet:
-    """
-    Cachea el Spreadsheet para evitar abrir y pedir metadata en cada llamada.
-    """
     sid = st.secrets.get("SPREADSHEET_ID")
     if not sid:
         raise RuntimeError("Falta SPREADSHEET_ID en secrets.")
@@ -62,8 +54,7 @@ def _ss() -> gspread.Spreadsheet:
             return _gc().open_by_key(sid)
         except gspread.exceptions.APIError as e:
             last_err = e
-            sleep_s = (2 ** attempt) + random.uniform(0, 0.5)
-            time.sleep(min(sleep_s, 12))
+            time.sleep(min((2 ** attempt) + random.uniform(0, 0.5), 12))
         except Exception as e:
             raise RuntimeError(f"Error abriendo Google Sheet: {type(e).__name__}: {e}") from e
 
@@ -71,45 +62,19 @@ def _ss() -> gspread.Spreadsheet:
 
 
 def _worksheets_map() -> dict[str, gspread.Worksheet]:
-    """
-    Devuelve un mapa {title: worksheet} usando ss.worksheets() UNA vez.
-    Esto evita ss.worksheet(tab) que vuelve a pedir metadata y puede disparar quota/429.
-    """
     ss = _ss()
-
     last_err = None
     for attempt in range(6):
         try:
-            wss = ss.worksheets()  # 1 fetch de metadata
+            wss = ss.worksheets()
             return {ws.title: ws for ws in wss}
         except gspread.exceptions.APIError as e:
             last_err = e
-            sleep_s = (2 ** attempt) + random.uniform(0, 0.5)
-            time.sleep(min(sleep_s, 10))
-
+            time.sleep(min((2 ** attempt) + random.uniform(0, 0.5), 10))
     raise RuntimeError(f"Error obteniendo worksheets metadata: {last_err}") from last_err
 
 
-def _ws(tab: str) -> gspread.Worksheet:
-    """
-    Obtiene worksheet por título desde el mapa. Si no existe, init_db() lo crea primero.
-    """
-    init_db()
-    wmap = _worksheets_map()
-    if tab not in wmap:
-        # si alguien borró una pestaña manualmente, reintenta crear
-        init_db(force=True)
-        wmap = _worksheets_map()
-    if tab not in wmap:
-        raise RuntimeError(f"No existe la pestaña '{tab}' en el spreadsheet.")
-    return wmap[tab]
-
-
 def init_db(force: bool = False) -> None:
-    """
-    Inicializa pestañas y headers.
-    IMPORTANTE: Se ejecuta 1 vez por sesión (a menos que force=True).
-    """
     if not force and st.session_state.get("_transit_db_inited", False):
         return
 
@@ -119,7 +84,6 @@ def init_db(force: bool = False) -> None:
 
     for tab, headers in SHEETS.items():
         if tab not in existing_titles:
-            # Crear worksheet
             last_err = None
             for attempt in range(6):
                 try:
@@ -128,13 +92,13 @@ def init_db(force: bool = False) -> None:
                     break
                 except gspread.exceptions.APIError as e:
                     last_err = e
-                    sleep_s = (2 ** attempt) + random.uniform(0, 0.5)
-                    time.sleep(min(sleep_s, 10))
+                    time.sleep(min((2 ** attempt) + random.uniform(0, 0.5), 10))
             else:
                 raise RuntimeError(f"No se pudo crear worksheet '{tab}': {last_err}") from last_err
         else:
             ws = wmap[tab]
-            first_row = ws.row_values(1)
+            # Evita row_values(1) (más propenso a fallos); usa get('1:1') con retry
+            first_row = _safe_get_row1(ws)
             if not first_row:
                 ws.append_row(headers)
             else:
@@ -145,21 +109,58 @@ def init_db(force: bool = False) -> None:
     st.session_state["_transit_db_inited"] = True
 
 
+def _safe_get_row1(ws: gspread.Worksheet) -> list[str]:
+    last_err = None
+    for attempt in range(6):
+        try:
+            vals = ws.get("1:1")
+            return vals[0] if vals and len(vals) > 0 else []
+        except gspread.exceptions.APIError as e:
+            last_err = e
+            time.sleep(min((2 ** attempt) + random.uniform(0, 0.5), 10))
+    raise RuntimeError(f"Error leyendo headers (1:1) en '{ws.title}': {last_err}") from last_err
+
+
+def _ws(tab: str) -> gspread.Worksheet:
+    init_db()
+    wmap = _worksheets_map()
+    if tab in wmap:
+        return wmap[tab]
+    init_db(force=True)
+    wmap = _worksheets_map()
+    if tab not in wmap:
+        raise RuntimeError(f"No existe la pestaña '{tab}' en el spreadsheet.")
+    return wmap[tab]
+
+
 def _get_all_records(tab: str) -> list[dict[str, Any]]:
     ws = _ws(tab)
-    try:
-        return ws.get_all_records()
-    except Exception as e:
-        header = ws.row_values(1)
-        raise RuntimeError(
-            f"Error leyendo tab '{tab}'. Revisa headers en fila 1.\n"
-            f"Headers actuales: {header}\n"
-            f"Detalle: {type(e).__name__}: {e}"
-        )
+    last_err = None
+    for attempt in range(6):
+        try:
+            return ws.get_all_records()
+        except gspread.exceptions.APIError as e:
+            last_err = e
+            time.sleep(min((2 ** attempt) + random.uniform(0, 0.5), 10))
+    header = _safe_get_row1(ws)
+    raise RuntimeError(
+        f"Error leyendo tab '{tab}'. Revisa headers en fila 1.\n"
+        f"Headers actuales: {header}\n"
+        f"Detalle: {last_err}"
+    )
 
 
 def _append(tab: str, row: list[Any]) -> None:
-    _ws(tab).append_row(row, value_input_option="USER_ENTERED")
+    ws = _ws(tab)
+    last_err = None
+    for attempt in range(6):
+        try:
+            ws.append_row(row, value_input_option="USER_ENTERED")
+            return
+        except gspread.exceptions.APIError as e:
+            last_err = e
+            time.sleep(min((2 ** attempt) + random.uniform(0, 0.5), 10))
+    raise RuntimeError(f"Error append_row en '{tab}': {last_err}") from last_err
 
 
 def _col_letter(n: int) -> str:
@@ -170,14 +171,6 @@ def _col_letter(n: int) -> str:
     return s
 
 
-def _update_row_by_headers(ws: gspread.Worksheet, row_index: int, headers: list[str], record: dict[str, Any]):
-    end_col = _col_letter(len(headers))
-    ws.update(f"A{row_index}:{end_col}{row_index}", [[record.get(h, "") for h in headers]])
-
-
-# -----------------------------
-# CLIENTS
-# -----------------------------
 def list_clients() -> pd.DataFrame:
     init_db()
     return pd.DataFrame(_get_all_records("clients"))
@@ -186,20 +179,9 @@ def list_clients() -> pd.DataFrame:
 def get_client(client_id: str) -> dict[str, Any] | None:
     init_db()
     for r in _get_all_records("clients"):
-        if str(r.get("client_id", "")) == str(client_id):
+        if str(r.get("client_id","")) == str(client_id):
             return r
     return None
-
-
-def search_clients(query: str) -> pd.DataFrame:
-    df = list_clients()
-    if df.empty:
-        return df
-    q = (query or "").strip().lower()
-    if not q:
-        return df
-    mask = df.apply(lambda r: q in str(r.to_dict()).lower(), axis=1)
-    return df[mask]
 
 
 def upsert_client(
@@ -220,7 +202,7 @@ def upsert_client(
 
     if client_id:
         for i, r in enumerate(records, start=2):
-            if str(r.get("client_id", "")) == client_id:
+            if str(r.get("client_id","")) == client_id:
                 updated = {
                     "client_id": client_id,
                     "name": name,
@@ -238,7 +220,7 @@ def upsert_client(
 
     max_n = 0
     for r in records:
-        cid = str(r.get("client_id", "")).strip()
+        cid = str(r.get("client_id","")).strip()
         if cid.startswith("CL-") and cid[3:].isdigit():
             max_n = max(max_n, int(cid[3:]))
     new_id = f"CL-{max_n+1:06d}"
@@ -247,9 +229,6 @@ def upsert_client(
     return new_id
 
 
-# -----------------------------
-# CASES
-# -----------------------------
 def list_cases() -> pd.DataFrame:
     init_db()
     return pd.DataFrame(_get_all_records("cases"))
@@ -266,17 +245,12 @@ def create_case(
     init_db()
     ws = _ws("cases")
     records = ws.get_all_records()
-    existing_ids = [r.get("case_id", "") for r in records]
+    existing_ids = [r.get("case_id","") for r in records]
     year = datetime.now().year
     case_id = next_case_id(existing_ids, year=year)
-
     now = _now_iso()
     cdate = case_date or datetime.now().date().isoformat()
-
-    row = [
-        case_id, client_id, cdate, status, origin, destination, notes, "",
-        now, now, "", ""
-    ]
+    row = [case_id, client_id, cdate, status, origin, destination, notes, "", now, now, "", ""]
     _append("cases", row)
     return case_id
 
@@ -284,42 +258,33 @@ def create_case(
 def get_case(case_id: str) -> dict[str, Any] | None:
     init_db()
     for r in _get_all_records("cases"):
-        if str(r.get("case_id", "")) == case_id:
+        if str(r.get("case_id","")) == case_id:
             return r
     return None
 
 
-def set_case_drive_folder(case_id: str, drive_folder_id: str) -> None:
-    init_db()
-    ws = _ws("cases")
-    records = ws.get_all_records()
-    now = _now_iso()
-    headers = ws.row_values(1)
-
-    for i, r in enumerate(records, start=2):
-        if str(r.get("case_id", "")) == case_id:
-            r["drive_folder_id"] = drive_folder_id
-            r["updated_at"] = now
-            _update_row_by_headers(ws, i, headers, r)
-            return
-
-
 def update_case_fields(case_id: str, fields: dict) -> None:
-    """
-    Actualiza campos (solo columnas existentes) para un case_id en 'cases'.
-    """
     init_db()
     ws = _ws("cases")
-    headers = ws.row_values(1)
-
+    headers = _safe_get_row1(ws)
     if "case_id" not in headers:
         raise RuntimeError("La hoja 'cases' no tiene columna case_id en headers.")
 
     col_case_id = headers.index("case_id") + 1
-    cell = ws.find(case_id, in_column=col_case_id)
-    if not cell:
-        raise ValueError(f"case_id no encontrado: {case_id}")
-    row = cell.row
+
+    last_err = None
+    for attempt in range(6):
+        try:
+            cell = ws.find(case_id, in_column=col_case_id)
+            if not cell:
+                raise ValueError(f"case_id no encontrado: {case_id}")
+            row = cell.row
+            break
+        except gspread.exceptions.APIError as e:
+            last_err = e
+            time.sleep(min((2 ** attempt) + random.uniform(0, 0.5), 10))
+    else:
+        raise RuntimeError(f"Error buscando case_id '{case_id}': {last_err}") from last_err
 
     updates = []
     for k, v in fields.items():
@@ -331,12 +296,18 @@ def update_case_fields(case_id: str, fields: dict) -> None:
         return
 
     payload = [{"range": f"{_col_letter(c)}{r}", "values": [[val]]} for (r, c, val) in updates]
-    ws.batch_update(payload)
+
+    last_err = None
+    for attempt in range(6):
+        try:
+            ws.batch_update(payload)
+            return
+        except gspread.exceptions.APIError as e:
+            last_err = e
+            time.sleep(min((2 ** attempt) + random.uniform(0, 0.5), 10))
+    raise RuntimeError(f"Error batch_update en 'cases': {last_err}") from last_err
 
 
-# -----------------------------
-# ITEMS
-# -----------------------------
 def list_items(case_id: Optional[str] = None) -> pd.DataFrame:
     init_db()
     df = pd.DataFrame(_get_all_records("items"))
@@ -350,7 +321,7 @@ def list_items(case_id: Optional[str] = None) -> pd.DataFrame:
 def _vin_exists_global(vin: str) -> bool:
     v = normalize_vin(vin)
     for r in _get_all_records("items"):
-        if str(r.get("item_type", "")) == "vehicle" and normalize_vin(str(r.get("unique_key", ""))) == v:
+        if str(r.get("item_type","")) == "vehicle" and normalize_vin(str(r.get("unique_key",""))) == v:
             return True
     return False
 
@@ -375,14 +346,10 @@ def add_vehicle_item(
         raise ValueError("Este VIN ya existe en el sistema (no se puede duplicar).")
 
     items_ws = _ws("items")
-    existing_item_ids = [r.get("item_id", "") for r in items_ws.get_all_records()]
+    existing_item_ids = [r.get("item_id","") for r in items_ws.get_all_records()]
     item_id = next_item_id(existing_item_ids)
     now = _now_iso()
-
-    row = [
-        item_id, case_id, "vehicle", v, brand, model, year,
-        description, int(quantity or 1), weight, value, source, now
-    ]
+    row = [item_id, case_id, "vehicle", v, brand, model, year, description, int(quantity or 1), weight, value, source, now]
     _append("items", row)
     return item_id
 
@@ -400,24 +367,17 @@ def add_article_item(
     init_db()
     items_ws = _ws("items")
     records = items_ws.get_all_records()
-    existing_item_ids = [r.get("item_id", "") for r in records]
-    existing_keys = [r.get("unique_key", "") for r in records if str(r.get("case_id", "")) == case_id]
+    existing_item_ids = [r.get("item_id","") for r in records]
+    existing_keys = [r.get("unique_key","") for r in records if str(r.get("case_id","")) == case_id]
 
     item_id = next_item_id(existing_item_ids)
     seq = next_article_seq(existing_keys, case_id=case_id)
     now = _now_iso()
-
-    row = [
-        item_id, case_id, "article", seq, brand, model, "",
-        description, int(quantity or 1), weight, value, source, now
-    ]
+    row = [item_id, case_id, "article", seq, brand, model, "", description, int(quantity or 1), weight, value, source, now]
     _append("items", row)
     return item_id
 
 
-# -----------------------------
-# DOCUMENTS
-# -----------------------------
 def list_documents(case_id: str) -> pd.DataFrame:
     init_db()
     df = pd.DataFrame(_get_all_records("documents"))
@@ -435,7 +395,7 @@ def add_document(
 ) -> str:
     init_db()
     docs_ws = _ws("documents")
-    existing_doc_ids = [r.get("doc_id", "") for r in docs_ws.get_all_records()]
+    existing_doc_ids = [r.get("doc_id","") for r in docs_ws.get_all_records()]
     doc_id = next_doc_id(existing_doc_ids)
     now = _now_iso()
     row = [doc_id, case_id, item_id, doc_type, drive_file_id, file_name, now]
