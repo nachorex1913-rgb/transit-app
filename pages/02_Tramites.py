@@ -3,7 +3,6 @@ from transit_core.gsheets_db import (
     list_clients, create_case, list_cases, get_case, list_items,
     add_vehicle_item, add_article_item, set_case_drive_folder
 )
-from transit_core.gdrive_storage import create_case_folder
 
 st.title("Trámites")
 
