@@ -64,7 +64,16 @@ def _ws(tab: str):
 
 def _get_all_records(tab: str) -> list[dict[str, Any]]:
     ws = _ws(tab)
-    return ws.get_all_records()
+    try:
+        return ws.get_all_records()
+    except Exception as e:
+        # Muestra diagnóstico útil en UI
+        header = ws.row_values(1)
+        raise RuntimeError(
+            f"Error leyendo tab '{tab}'. Revisa headers en fila 1.\n"
+            f"Headers actuales: {header}\n"
+            f"Detalle: {type(e).__name__}: {e}"
+        )
 
 def _append(tab: str, row: list[Any]) -> None:
     _ws(tab).append_row(row, value_input_option="USER_ENTERED")
