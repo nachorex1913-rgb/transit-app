@@ -12,12 +12,14 @@ from googleapiclient.errors import HttpError
 
 from .ids import normalize_name_for_folder
 
+from googleapiclient.discovery import build
+from .auth import get_drive_user_credentials
+
 @st.cache_resource
 def _drive():
-    sa = st.secrets["gcp_service_account"]
-    scopes = ["https://www.googleapis.com/auth/drive"]
-    creds = Credentials.from_service_account_info(sa, scopes=scopes)
+    creds = get_drive_user_credentials()
     return build("drive", "v3", credentials=creds)
+
 
 SUBFOLDERS = {
     "01_Docs_Cliente": "01_Docs_Cliente",
