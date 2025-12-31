@@ -9,6 +9,9 @@ import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
 import streamlit as st
+import time
+import random
+import gspread
 
 from .ids import next_case_id, next_article_seq, next_item_id, next_doc_id
 from .validators import is_valid_vin, normalize_vin
@@ -37,7 +40,24 @@ def _gc() -> gspread.Client:
     return gspread.authorize(creds)
 
 def _ss():
-    return _gc().open_by_key(st.secrets["SPREADSHEET_ID"])
+    sid = st.secrets.get("SPREADSHEET_ID")
+    if not sid:
+        raise RuntimeError("Falta SPREADSHEET_ID en secrets.")
+
+    last_err = None
+    for attempt in range(6):  # ~ hasta 1 min
+        try:
+            return _gc().open_by_key(sid)
+        except gspread.exceptions.APIError as e:
+            last_err = e
+            # backoff exponencial con jitter
+            sleep_s = (2 ** attempt) + random.uniform(0, 0.5)
+            time.sleep(min(sleep_s, 10))
+        except Exception as e:
+            raise RuntimeError(f"Error abriendo Google Sheet: {type(e).__name__}: {e}") from e
+
+    raise RuntimeError(f"Google Sheets APIError persistente: {last_err}") from last_err
+
 
 def init_db() -> None:
     ss = _ss()
