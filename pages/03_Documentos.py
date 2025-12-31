@@ -29,10 +29,13 @@ subfolder = {
 file = st.file_uploader("Subir archivo", type=None)
 if file and st.button("Subir a Drive"):
     file_bytes = file.read()
+try:
     drive_id = upload_file(case["drive_folder_id"], file_bytes, file.name, subfolder)
     add_document(case_id=case_id, drive_file_id=drive_id, file_name=file.name, doc_type=doc_type)
     st.success("Documento subido y registrado.")
-    from googleapiclient.errors import HttpError
+except HttpError as e:
+    st.error(f"Drive HttpError (status {e.resp.status}). Reintenta. Si persiste, revisa permisos.")
+
 
 try:
     drive_id = upload_file(...)
