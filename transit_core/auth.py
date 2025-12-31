@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import streamlit as st
 import gspread
+
 from google.oauth2.service_account import Credentials as SACredentials
 from google.oauth2.credentials import Credentials as UserCredentials
 from google_auth_oauthlib.flow import Flow
@@ -66,13 +67,6 @@ def _clear_query_params():
 
 
 def drive_oauth_ready_ui() -> bool:
-    st.write("DEBUG URL query params:", _get_query_params())
-st.write("DEBUG redirect_uri:", st.secrets["google_oauth"]["redirect_uri"])
-
-    """
-    UI para autorizar Drive por OAuth (una sola vez).
-    Devuelve True si ya hay token guardado y listo.
-    """
     token = _get_token_json("drive_token")
     if token:
         return True
@@ -98,6 +92,7 @@ st.write("DEBUG redirect_uri:", st.secrets["google_oauth"]["redirect_uri"])
 
     qp = _get_query_params()
     code = qp.get("code")
+
     if isinstance(code, list):
         code = code[0] if code else None
 
@@ -105,6 +100,7 @@ st.write("DEBUG redirect_uri:", st.secrets["google_oauth"]["redirect_uri"])
         try:
             flow.fetch_token(code=code)
             creds = flow.credentials
+
             token_payload = {
                 "token": creds.token,
                 "refresh_token": creds.refresh_token,
@@ -113,10 +109,13 @@ st.write("DEBUG redirect_uri:", st.secrets["google_oauth"]["redirect_uri"])
                 "client_secret": creds.client_secret,
                 "scopes": creds.scopes,
             }
+
             _set_token_json("drive_token", token_payload)
             _clear_query_params()
-            st.success("✅ Drive conectado. Ya puedes subir documentos.")
+
+            st.success("✅ Drive conectado.")
             st.rerun()
+
         except Exception as e:
             st.error(f"No pude completar OAuth: {type(e).__name__}: {e}")
             return False
@@ -127,7 +126,6 @@ st.write("DEBUG redirect_uri:", st.secrets["google_oauth"]["redirect_uri"])
         prompt="consent",
     )
 
-    st.markdown("### 1) Haz clic para conectar Drive")
     st.link_button("Conectar Google Drive", auth_url)
     st.caption("Después de autorizar, Google te regresará a esta app y se guardará el token.")
     return False
