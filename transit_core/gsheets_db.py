@@ -290,3 +290,50 @@ def add_document(
     _append("documents", row)
     return doc_id
 
+# transit_core/gsheets_db.py
+from __future__ import annotations
+import streamlit as st
+import pandas as pd
+from datetime import datetime
+
+# ... tus imports y helpers actuales (_gc, _ss, _ws, etc.)
+
+def update_case_fields(case_id: str, fields: dict) -> None:
+    """
+    Actualiza campos en la fila del case_id dentro de la hoja 'cases'.
+    Requiere que las columnas existan en la fila 1.
+    """
+    ws = _ws("cases")
+    headers = ws.row_values(1)
+
+    # Encuentra fila del case
+    col_case_id = headers.index("case_id") + 1
+    cell = ws.find(case_id, in_column=col_case_id)
+    if not cell:
+        raise ValueError(f"case_id no encontrado: {case_id}")
+    row = cell.row
+
+    updates = []
+    for k, v in fields.items():
+        if k in headers:
+            col = headers.index(k) + 1
+            updates.append((row, col, "" if v is None else str(v)))
+
+    if not updates:
+        return
+
+    # Batch update
+    rng = [f"{_col_letter(c)}{r}" for (r, c, _) in updates]
+    values = [[val] for (_, _, val) in updates]
+    ws.batch_update([{"range": a1, "values": v} for a1, v in zip(rng, values)])
+
+
+def _col_letter(n: int) -> str:
+    """1->A, 2->B ..."""
+    s = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
