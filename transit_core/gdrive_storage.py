@@ -111,3 +111,14 @@ def upload_file(case_folder_id: str, file_bytes: bytes, filename: str, subfolder
             raise
 
     raise last_err
+def debug_folder(folder_id: str) -> dict:
+    """
+    Devuelve metadata y capabilities del folder para diagnosticar 403.
+    """
+    service = _drive()
+    meta = service.files().get(
+        fileId=folder_id,
+        fields="id,name,owners,permissions,capabilities,parents,driveId",
+        supportsAllDrives=True,
+    ).execute()
+    return meta
