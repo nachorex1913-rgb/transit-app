@@ -73,6 +73,9 @@ def drive_oauth_ready_ui() -> bool:
 
     st.warning("Drive OAuth no está conectado. Conecta tu Google Drive para poder subir documentos.")
     st.write("DEBUG redirect_uri usado:", redirect_uri)
+    st.write("DEBUG redirect_uri:", st.secrets["google_oauth"]["redirect_uri"])
+st.write("DEBUG client_id:", st.secrets["google_oauth"]["client_id"])
+
 
 
     client_id = st.secrets["google_oauth"]["client_id"]
