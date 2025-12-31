@@ -1,77 +1,105 @@
 import streamlit as st
+import pandas as pd
+from datetime import datetime
+
 from transit_core.gsheets_db import (
-    list_clients, create_case, list_cases, get_case, list_items,
-    add_vehicle_item, add_article_item, set_case_drive_folder
+    get_cases_df,
+    get_clients_df,
+    create_case,
+    update_case_fields,
 )
 
+from transit_core.drive_bridge import create_case_folder_via_script
+
+
+st.set_page_config(page_title="Trámites", layout="wide")
 st.title("Trámites")
 
-clients = list_clients()
-if clients.empty:
-    st.warning("Primero crea un cliente.")
+
+# --------- Helpers ----------
+def _now_iso() -> str:
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+# --------- Load data ----------
+clients_df = get_clients_df()
+cases_df = get_cases_df()
+
+if clients_df is None or clients_df.empty:
+    st.warning("No hay clientes todavía. Crea un cliente primero en la página Clientes.")
     st.stop()
 
+# --------- UI: Create case ----------
 st.subheader("Crear trámite")
-client_label = clients.apply(lambda r: f"{r['client_id']} - {r['name']}", axis=1).tolist()
-client_pick = st.selectbox("Cliente", client_label)
-client_id = client_pick.split(" - ")[0].strip()
 
-origin = st.text_input("Origen", "USA")
-destination = st.text_input("Destino", "")
-notes = st.text_area("Notas", "")
+col1, col2, col3 = st.columns([2, 2, 2])
 
-if st.button("Crear trámite"):
-    case_id = create_case(client_id=client_id, origin=origin, destination=destination, notes=notes)
-    st.success(f"Trámite creado: {case_id}")
+with col1:
+    client_options = (
+        clients_df[["client_id", "full_name"]]
+        .fillna("")
+        .assign(label=lambda d: d["client_id"] + " — " + d["full_name"])
+    )
+    selected_label = st.selectbox("Cliente", client_options["label"].tolist())
+    selected_client_id = client_options.loc[client_options["label"] == selected_label, "client_id"].iloc[0]
+
+with col2:
+    case_type = st.selectbox("Tipo de trámite", ["Exportación", "Importación", "Otro"])
+
+with col3:
+    notes = st.text_input("Notas (opcional)", "")
+
+create_btn = st.button("Crear trámite", type="primary")
+
+if create_btn:
+    try:
+        # 1) Create case in Sheets (returns case dict or at least case_id)
+        new_case = create_case(
+            client_id=selected_client_id,
+            case_type=case_type,
+            notes=notes,
+        )
+
+        # Asegúrate que tu create_case devuelve case_id
+        case_id = new_case["case_id"] if isinstance(new_case, dict) else new_case
+        if not case_id:
+            raise RuntimeError("create_case() no devolvió case_id")
+
+        # 2) Create Drive folder via Apps Script
+        root_folder_id = st.secrets["drive"]["root_folder_id"]
+        drive_res = create_case_folder_via_script(root_folder_id=root_folder_id, case_id=case_id)
+        drive_folder_id = drive_res["folder_id"]
+
+        # 3) Save drive_folder_id in cases
+        update_case_fields(case_id, {"drive_folder_id": drive_folder_id, "updated_at": _now_iso()})
+
+        st.success(f"Trámite creado: {case_id}")
+        st.info(f"Carpeta Drive creada: {drive_folder_id}")
+
+        # refresh
+        st.rerun()
+
+    except Exception as e:
+        st.error(f"Error creando trámite: {e}")
+
 
 st.divider()
-st.subheader("Seleccionar trámite")
-cases = list_cases()
-case_pick = st.selectbox("Trámite", cases["case_id"].tolist() if not cases.empty else [])
-if not case_pick:
+
+# --------- UI: List cases ----------
+st.subheader("Listado de trámites")
+
+cases_df = get_cases_df()
+if cases_df is None or cases_df.empty:
+    st.info("No hay trámites aún.")
     st.stop()
 
-case = get_case(case_pick)
-st.write(case)
+# Join with client names (optional)
+clients_map = clients_df.set_index("client_id")["full_name"].to_dict()
+cases_df = cases_df.copy()
+if "client_id" in cases_df.columns:
+    cases_df["client_name"] = cases_df["client_id"].map(clients_map)
 
-# Crear carpeta Drive si no existe
-if case and not case.get("drive_folder_id"):
-    if st.button("Crear carpeta Drive para este trámite"):
-        client_name = clients[clients["client_id"] == case["client_id"]].iloc[0]["name"]
-        folder_id = create_case_folder(case_id=case["case_id"], client_name=client_name, case_date=case["case_date"])
-        set_case_drive_folder(case["case_id"], folder_id)
-        st.success("Carpeta creada y ligada al trámite.")
+show_cols = [c for c in ["case_id", "client_id", "client_name", "case_type", "status", "drive_folder_id", "created_at"] if c in cases_df.columns]
+st.dataframe(cases_df[show_cols].sort_values(by="case_id", ascending=False), use_container_width=True)
 
-st.divider()
-st.subheader("Agregar vehículo (manual)")
-vin = st.text_input("VIN (17 caracteres)", "").strip().upper()
-brand = st.text_input("Marca", "")
-model = st.text_input("Modelo", "")
-year = st.text_input("Año", "")
-weight = st.text_input("Peso (opcional)", "")
-if st.button("Guardar vehículo"):
-    try:
-        add_vehicle_item(case_id=case_pick, vin=vin, brand=brand, model=model, year=year, weight=weight)
-        st.success("Vehículo guardado.")
-    except Exception as e:
-        st.error(str(e))
-
-st.divider()
-st.subheader("Agregar artículo (manual rápido)")
-desc = st.text_input("Descripción", "")
-a_brand = st.text_input("Marca (artículo)", "")
-a_model = st.text_input("Modelo (artículo)", "")
-a_weight = st.text_input("Peso (artículo)", "")
-qty = st.number_input("Cantidad (siempre recomendado 1 por línea)", min_value=1, value=1, step=1)
-if st.button("Guardar artículo"):
-    if not desc.strip():
-        st.error("Descripción requerida.")
-    else:
-        add_article_item(case_id=case_pick, description=desc, brand=a_brand, model=a_model, weight=a_weight, quantity=int(qty))
-        st.success("Artículo guardado.")
-
-st.divider()
-st.subheader("Items del trámite")
-items = list_items(case_pick)
-st.dataframe(items, use_container_width=True)
-
+st.caption("Tip: si no ves drive_folder_id, revisa que update_case_fields esté funcionando y que cases tenga esa columna.")
