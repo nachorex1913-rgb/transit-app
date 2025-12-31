@@ -68,14 +68,6 @@ if st.button("Guardar artículo"):
     if not desc.strip():
         st.error("Descripción requerida.")
     else:
-        st.write({
-  "case_id": case_pick,
-  "description": desc,
-  "brand": a_brand,
-  "model": a_model,
-  "weight": a_weight,
-  "qty": qty
-})
         add_article_item(case_id=case_pick, description=desc, brand=a_brand, model=a_model, weight=a_weight, quantity=int(qty))
         st.success("Artículo guardado.")
 
