@@ -1,7 +1,6 @@
 # transit_core/gsheets_db.py
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, Any
 
@@ -11,17 +10,18 @@ from google.oauth2.service_account import Credentials
 import streamlit as st
 import time
 import random
-import gspread
 
 from .ids import next_case_id, next_article_seq, next_item_id, next_doc_id
 from .validators import is_valid_vin, normalize_vin
 
 SHEETS = {
     "clients": ["client_id","name","address","id_type","id_number","phone","email","country_destination","created_at","updated_at"],
-    "cases": ["case_id","client_id","case_date","status","origin","destination","notes","drive_folder_id","created_at","updated_at"],
+    # 👇 agrega columnas nuevas (si no existen aún, init_db las crea al final)
+    "cases": ["case_id","client_id","case_date","status","origin","destination","notes","drive_folder_id","created_at","updated_at","final_pdf_drive_id","final_pdf_uploaded_at"],
     "items": ["item_id","case_id","item_type","unique_key","brand","model","year","description","quantity","weight","value","source","created_at"],
     "documents": ["doc_id","case_id","item_id","doc_type","drive_file_id","file_name","uploaded_at"],
     "audit_log": ["log_id","timestamp","user","action","entity","entity_id","details"],
+    "oauth_tokens": ["key","value"],  # por si la usas
 }
 
 DEFAULT_STATUS = "Borrador"
@@ -45,12 +45,11 @@ def _ss():
         raise RuntimeError("Falta SPREADSHEET_ID en secrets.")
 
     last_err = None
-    for attempt in range(6):  # ~ hasta 1 min
+    for attempt in range(6):
         try:
             return _gc().open_by_key(sid)
         except gspread.exceptions.APIError as e:
             last_err = e
-            # backoff exponencial con jitter
             sleep_s = (2 ** attempt) + random.uniform(0, 0.5)
             time.sleep(min(sleep_s, 10))
         except Exception as e:
@@ -58,36 +57,31 @@ def _ss():
 
     raise RuntimeError(f"Google Sheets APIError persistente: {last_err}") from last_err
 
+def _ws(tab: str):
+    return _ss().worksheet(tab)
 
 def init_db() -> None:
     ss = _ss()
     existing = {ws.title for ws in ss.worksheets()}
     for tab, headers in SHEETS.items():
         if tab not in existing:
-            ws = ss.add_worksheet(title=tab, rows=2000, cols=max(10, len(headers)+2))
+            ws = ss.add_worksheet(title=tab, rows=2000, cols=max(10, len(headers) + 2))
             ws.append_row(headers)
         else:
             ws = ss.worksheet(tab)
             first_row = ws.row_values(1)
-            if first_row != headers:
-                # si está vacía o headers incompletos, los reescribe
-                if len(first_row) == 0:
-                    ws.append_row(headers)
-                else:
-                    # no destruyo datos; solo aseguro que existan columnas al final
-                    missing = [h for h in headers if h not in first_row]
-                    if missing:
-                        ws.update("1:1", [first_row + missing])
-
-def _ws(tab: str):
-    return _ss().worksheet(tab)
+            if len(first_row) == 0:
+                ws.append_row(headers)
+            else:
+                missing = [h for h in headers if h not in first_row]
+                if missing:
+                    ws.update("1:1", [first_row + missing])
 
 def _get_all_records(tab: str) -> list[dict[str, Any]]:
     ws = _ws(tab)
     try:
         return ws.get_all_records()
     except Exception as e:
-        # Muestra diagnóstico útil en UI
         header = ws.row_values(1)
         raise RuntimeError(
             f"Error leyendo tab '{tab}'. Revisa headers en fila 1.\n"
@@ -98,8 +92,31 @@ def _get_all_records(tab: str) -> list[dict[str, Any]]:
 def _append(tab: str, row: list[Any]) -> None:
     _ws(tab).append_row(row, value_input_option="USER_ENTERED")
 
+def _col_letter(n: int) -> str:
+    s = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+def _update_row_by_headers(ws, row_index: int, headers: list[str], record: dict[str, Any]):
+    # actualiza desde col A hasta la última columna de headers
+    end_col = _col_letter(len(headers))
+    ws.update(f"A{row_index}:{end_col}{row_index}", [[record.get(h, "") for h in headers]])
+
+# -----------------------------
+# CLIENTS
+# -----------------------------
 def list_clients() -> pd.DataFrame:
+    init_db()
     return pd.DataFrame(_get_all_records("clients"))
+
+def get_client(client_id: str) -> dict[str, Any] | None:
+    init_db()
+    for r in _get_all_records("clients"):
+        if str(r.get("client_id","")) == str(client_id):
+            return r
+    return None
 
 def search_clients(query: str) -> pd.DataFrame:
     df = list_clients()
@@ -121,12 +138,13 @@ def upsert_client(
     country_destination: str = "",
     client_id: Optional[str] = None,
 ) -> str:
+    init_db()
     ws = _ws("clients")
     records = ws.get_all_records()
     now = _now_iso()
+    headers = SHEETS["clients"]
 
     if client_id:
-        # update
         for i, r in enumerate(records, start=2):
             if str(r.get("client_id","")) == client_id:
                 updated = {
@@ -141,12 +159,9 @@ def upsert_client(
                     "created_at": r.get("created_at") or now,
                     "updated_at": now,
                 }
-                headers = SHEETS["clients"]
-                ws.update(f"A{i}:J{i}", [[updated.get(h,"") for h in headers]])
+                _update_row_by_headers(ws, i, headers, updated)
                 return client_id
 
-    # create
-    # client_id CL-000001 incremental
     max_n = 0
     for r in records:
         cid = str(r.get("client_id","")).strip()
@@ -157,7 +172,11 @@ def upsert_client(
     _append("clients", row)
     return new_id
 
+# -----------------------------
+# CASES
+# -----------------------------
 def list_cases() -> pd.DataFrame:
+    init_db()
     return pd.DataFrame(_get_all_records("cases"))
 
 def create_case(
@@ -176,29 +195,70 @@ def create_case(
     case_id = next_case_id(existing_ids, year=year)
     now = _now_iso()
     cdate = case_date or datetime.now().date().isoformat()
-    row = [case_id, client_id, cdate, status, origin, destination, notes, "", now, now]
+
+    # respeta headers actuales
+    row = [
+        case_id, client_id, cdate, status, origin, destination, notes, "", now, now,
+        "", ""  # final_pdf_drive_id, final_pdf_uploaded_at
+    ]
     _append("cases", row)
     return case_id
 
 def get_case(case_id: str) -> dict[str, Any] | None:
+    init_db()
     for r in _get_all_records("cases"):
         if str(r.get("case_id","")) == case_id:
             return r
     return None
 
 def set_case_drive_folder(case_id: str, drive_folder_id: str) -> None:
+    init_db()
     ws = _ws("cases")
     records = ws.get_all_records()
     now = _now_iso()
-    headers = SHEETS["cases"]
+    headers = ws.row_values(1)
+
     for i, r in enumerate(records, start=2):
         if str(r.get("case_id","")) == case_id:
             r["drive_folder_id"] = drive_folder_id
             r["updated_at"] = now
-            ws.update(f"A{i}:J{i}", [[r.get(h,"") for h in headers]])
+            _update_row_by_headers(ws, i, headers, r)
             return
 
+def update_case_fields(case_id: str, fields: dict) -> None:
+    """
+    Actualiza campos (solo columnas existentes) para un case_id en 'cases'.
+    """
+    init_db()
+    ws = _ws("cases")
+    headers = ws.row_values(1)
+
+    if "case_id" not in headers:
+        raise RuntimeError("La hoja 'cases' no tiene columna case_id en headers.")
+
+    col_case_id = headers.index("case_id") + 1
+    cell = ws.find(case_id, in_column=col_case_id)
+    if not cell:
+        raise ValueError(f"case_id no encontrado: {case_id}")
+    row = cell.row
+
+    updates = []
+    for k, v in fields.items():
+        if k in headers:
+            col = headers.index(k) + 1
+            updates.append((row, col, "" if v is None else str(v)))
+
+    if not updates:
+        return
+
+    payload = [{"range": f"{_col_letter(c)}{r}", "values": [[val]]} for (r, c, val) in updates]
+    ws.batch_update(payload)
+
+# -----------------------------
+# ITEMS
+# -----------------------------
 def list_items(case_id: Optional[str] = None) -> pd.DataFrame:
+    init_db()
     df = pd.DataFrame(_get_all_records("items"))
     if df.empty:
         return df
@@ -225,6 +285,7 @@ def add_vehicle_item(
     value: str = "",
     source: str = "manual",
 ) -> str:
+    init_db()
     v = normalize_vin(vin)
     if not is_valid_vin(v):
         raise ValueError("VIN inválido. Debe tener 17 caracteres y no incluir I/O/Q.")
@@ -253,6 +314,7 @@ def add_article_item(
     value: str = "",
     source: str = "manual",
 ) -> str:
+    init_db()
     items_ws = _ws("items")
     records = items_ws.get_all_records()
     existing_item_ids = [r.get("item_id","") for r in records]
@@ -263,13 +325,17 @@ def add_article_item(
     now = _now_iso()
 
     row = [
-        item_id, case_id, "article", seq, brand, model, "",  # year vacío
+        item_id, case_id, "article", seq, brand, model, "",
         description, int(quantity or 1), weight, value, source, now
     ]
     _append("items", row)
     return item_id
 
+# -----------------------------
+# DOCUMENTS
+# -----------------------------
 def list_documents(case_id: str) -> pd.DataFrame:
+    init_db()
     df = pd.DataFrame(_get_all_records("documents"))
     if df.empty:
         return df
@@ -282,6 +348,7 @@ def add_document(
     doc_type: str,
     item_id: str = "",
 ) -> str:
+    init_db()
     docs_ws = _ws("documents")
     existing_doc_ids = [r.get("doc_id","") for r in docs_ws.get_all_records()]
     doc_id = next_doc_id(existing_doc_ids)
@@ -289,51 +356,3 @@ def add_document(
     row = [doc_id, case_id, item_id, doc_type, drive_file_id, file_name, now]
     _append("documents", row)
     return doc_id
-
-# transit_core/gsheets_db.py
-from __future__ import annotations
-import streamlit as st
-import pandas as pd
-from datetime import datetime
-
-# ... tus imports y helpers actuales (_gc, _ss, _ws, etc.)
-
-def update_case_fields(case_id: str, fields: dict) -> None:
-    """
-    Actualiza campos en la fila del case_id dentro de la hoja 'cases'.
-    Requiere que las columnas existan en la fila 1.
-    """
-    ws = _ws("cases")
-    headers = ws.row_values(1)
-
-    # Encuentra fila del case
-    col_case_id = headers.index("case_id") + 1
-    cell = ws.find(case_id, in_column=col_case_id)
-    if not cell:
-        raise ValueError(f"case_id no encontrado: {case_id}")
-    row = cell.row
-
-    updates = []
-    for k, v in fields.items():
-        if k in headers:
-            col = headers.index(k) + 1
-            updates.append((row, col, "" if v is None else str(v)))
-
-    if not updates:
-        return
-
-    # Batch update
-    rng = [f"{_col_letter(c)}{r}" for (r, c, _) in updates]
-    values = [[val] for (_, _, val) in updates]
-    ws.batch_update([{"range": a1, "values": v} for a1, v in zip(rng, values)])
-
-
-def _col_letter(n: int) -> str:
-    """1->A, 2->B ..."""
-    s = ""
-    while n:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
-    return s
-
-
