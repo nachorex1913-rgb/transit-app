@@ -11,132 +11,120 @@ from transit_core.gsheets_db import (
     add_document,
     update_case_fields,
 )
-
-from transit_core.pdf_generator import generate_case_pdf
 from transit_core.drive_bridge import upload_to_drive_via_script
 
+# Importa tu generador real:
+from transit_core.pdf_generator import generate_case_pdf
 
+
+st.set_page_config(page_title="PDF Final", layout="wide")
 st.title("PDF Final")
 
-def now_str():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def pdf_filename(case_id: str) -> str:
-    return f"{case_id}.pdf"
+def _now_iso_utc() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
-cases = list_cases()
-if cases is None or cases.empty:
-    st.warning("No hay trámites aún.")
+
+# 1) Cargar casos (una vez)
+cases_df = list_cases()
+if cases_df is None or cases_df.empty:
+    st.info("No hay trámites aún.")
     st.stop()
 
-case_id = st.selectbox("Selecciona un trámite", cases["case_id"].tolist())
+cases_df = cases_df.fillna("")
+cases_df["label"] = cases_df["case_id"].astype(str) + " — " + cases_df.get("status", "")
+
+selected = st.selectbox("Selecciona un trámite", cases_df["case_id"].tolist())
+case_id = str(selected)
+
 case = get_case(case_id)
 if not case:
+    st.error("No se pudo cargar el trámite.")
     st.stop()
 
 client = get_client(case.get("client_id", ""))
-if not client:
-    st.error("No se encontró el cliente asociado a este trámite.")
-    st.stop()
-
-folder_id = case.get("drive_folder_id", "")
+items_df = list_items(case_id=case_id)
+docs_df = list_documents(case_id=case_id)
 
 st.divider()
-c1, c2, c3 = st.columns(3)
-c1.metric("Trámite", case.get("case_id", ""))
-c2.metric("Fecha", case.get("case_date", ""))
-c3.metric("Estatus", case.get("status", "Borrador"))
-st.caption(f"Origen: {case.get('origin','')}  |  Destino: {case.get('destination','')}")
+st.write(f"**Trámite:** {case_id}")
+st.write(f"**Cliente:** {client.get('name','') if client else ''}")
+st.write(f"**Drive folder:** {case.get('drive_folder_id','')}")
 
-if folder_id:
-    st.caption("Drive folder_id:")
-    st.code(folder_id)
-else:
-    st.warning("Este trámite no tiene carpeta en Drive (drive_folder_id). Ve a Trámites y créala primero.")
+# 2) Generar PDF
+st.subheader("Generar PDF")
 
-items_df = list_items(case_id)
-docs_df = list_documents(case_id)
+gen_col1, gen_col2 = st.columns([1, 2])
 
-with st.expander("Ver ítems / documentos", expanded=False):
-    st.subheader("Ítems")
-    st.dataframe(items_df, use_container_width=True)
-    st.subheader("Documentos")
-    st.dataframe(docs_df, use_container_width=True)
+with gen_col1:
+    gen_btn = st.button("Generar PDF", type="primary")
 
-st.divider()
-st.subheader("Generación del PDF")
+with gen_col2:
+    st.caption("Genera el PDF final desde los datos del trámite. Luego puedes descargarlo o subirlo a Drive.")
 
-if "pdf_cache" not in st.session_state:
-    st.session_state["pdf_cache"] = {}
+if "pdf_bytes" not in st.session_state:
+    st.session_state["pdf_bytes"] = None
 
-b1, b2, b3 = st.columns([1,1,2])
+if gen_btn:
+    try:
+        pdf_bytes = generate_case_pdf(case, client, items_df, docs_df)
+        if not isinstance(pdf_bytes, (bytes, bytearray)) or len(pdf_bytes) == 0:
+            raise RuntimeError("generate_case_pdf no devolvió bytes válidos.")
+        st.session_state["pdf_bytes"] = bytes(pdf_bytes)
+        st.success("PDF generado.")
+    except Exception as e:
+        st.error(f"Error generando PDF: {type(e).__name__}: {e}")
 
-with b1:
-    if st.button("Generar PDF", use_container_width=True):
-        try:
-            with st.spinner("Generando PDF..."):
-                pdf_bytes = generate_case_pdf(case, client, items_df, docs_df)
-                if not isinstance(pdf_bytes, (bytes, bytearray)) or len(pdf_bytes) < 200:
-                    raise RuntimeError("El generador no devolvió bytes válidos.")
-                st.session_state["pdf_cache"][case_id] = bytes(pdf_bytes)
-            st.success("✅ PDF generado.")
-        except Exception as e:
-            st.error(f"No se pudo generar PDF: {type(e).__name__}: {e}")
+pdf_bytes = st.session_state.get("pdf_bytes")
+if pdf_bytes:
+    file_name = f"{case_id}_PDF_Final.pdf"
 
-pdf_bytes = st.session_state["pdf_cache"].get(case_id)
+    st.download_button(
+        label="Descargar PDF",
+        data=pdf_bytes,
+        file_name=file_name,
+        mime="application/pdf",
+        type="secondary",
+    )
 
-with b2:
-    if pdf_bytes:
-        st.download_button(
-            "Descargar PDF",
-            data=pdf_bytes,
-            file_name=pdf_filename(case_id),
-            mime="application/pdf",
-            use_container_width=True,
-        )
+    st.divider()
+    st.subheader("Subir PDF a Drive")
+
+    if not case.get("drive_folder_id"):
+        st.warning("Este trámite no tiene drive_folder_id. Crea o re-crea la carpeta del trámite.")
     else:
-        st.button("Descargar PDF", disabled=True, use_container_width=True)
+        up_btn = st.button("Subir PDF final a Drive", type="primary")
 
-with b3:
-    st.caption("Si cambias ítems o datos del cliente, vuelve a generar el PDF.")
-
-st.divider()
-st.subheader("Subir PDF Final a Drive")
-
-if not folder_id:
-    st.info("Primero asigna/crea la carpeta del trámite en Drive.")
-elif not pdf_bytes:
-    st.info("Primero genera el PDF.")
-else:
-    if st.button("Subir PDF a Drive", use_container_width=True):
-        try:
-            with st.spinner("Subiendo PDF a Drive..."):
-                filename = pdf_filename(case_id)
-
-                drive_id = upload_to_drive_via_script(
-                    folder_id=folder_id,
-                    file_name=filename,
+        if up_btn:
+            try:
+                drive_folder_id = case["drive_folder_id"]
+                drive_file_id = upload_to_drive_via_script(
+                    folder_id=drive_folder_id,
+                    file_name=file_name,
                     mime_type="application/pdf",
                     file_bytes=pdf_bytes,
                 )
 
-                # registra como doc
+                # Registrar en documents
                 add_document(
                     case_id=case_id,
-                    drive_file_id=drive_id,
-                    file_name=filename,
+                    drive_file_id=drive_file_id,
+                    file_name=file_name,
                     doc_type="pdf_final",
                     item_id="",
                 )
 
-                # guarda referencia en cases
+                # Guardar en cases
                 update_case_fields(case_id, {
-                    "final_pdf_drive_id": drive_id,
-                    "final_pdf_uploaded_at": now_str(),
-                    "updated_at": now_str(),
+                    "final_pdf_drive_id": drive_file_id,
+                    "final_pdf_uploaded_at": _now_iso_utc(),
+                    "updated_at": _now_iso_utc(),
                 })
 
-            st.success(f"✅ PDF subido y registrado. drive_file_id: {drive_id}")
+                st.success(f"PDF subido a Drive: {drive_file_id}")
+                st.rerun()
 
-        except Exception as e:
-            st.error(f"No se pudo subir el PDF: {type(e).__name__}: {e}")
+            except Exception as e:
+                st.error(f"Error subiendo PDF: {type(e).__name__}: {e}")
+else:
+    st.info("Genera el PDF para habilitar descarga y subida a Drive.")
