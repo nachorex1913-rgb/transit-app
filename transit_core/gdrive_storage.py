@@ -67,6 +67,10 @@ def _find_child_folder(parent_id: str, name: str) -> Optional[str]:
 ).execute()
 
 
+import time
+import random
+from googleapiclient.errors import HttpError
+
 def upload_file(case_folder_id: str, file_bytes: bytes, filename: str, subfolder_key: str) -> str:
     service = _drive()
     sub_name = SUBFOLDERS.get(subfolder_key, subfolder_key)
@@ -74,6 +78,25 @@ def upload_file(case_folder_id: str, file_bytes: bytes, filename: str, subfolder
 
     media = MediaInMemoryUpload(file_bytes, resumable=False)
     metadata = {"name": filename, "parents": [sub_id]}
-    f = service.files().create(body=metadata, media_body=media, fields="id").execute()
-    return f["id"]
+
+    last_err = None
+    for attempt in range(6):
+        try:
+            f = service.files().create(
+                body=metadata,
+                media_body=media,
+                fields="id",
+                supportsAllDrives=True,
+            ).execute()
+            return f["id"]
+        except HttpError as e:
+            last_err = e
+            status = getattr(e.resp, "status", None)
+            # retry solo para errores temporales típicos
+            if status in (429, 500, 502, 503, 504):
+                time.sleep(min((2 ** attempt) + random.uniform(0, 0.5), 10))
+                continue
+            raise
+    raise last_err
+
 
