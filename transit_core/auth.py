@@ -1,100 +1,153 @@
-# transit_core/gdrive_storage.py
+# transit_core/auth.py
 from __future__ import annotations
-from typing import Optional
-import time
-import random
 
+import json
 import streamlit as st
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaInMemoryUpload
-from googleapiclient.errors import HttpError
+import gspread
+from google.oauth2.service_account import Credentials as SACredentials
+from google.oauth2.credentials import Credentials as UserCredentials
+from google_auth_oauthlib.flow import Flow
+from google.auth.transport.requests import Request
 
-from .ids import normalize_name_for_folder
-from .auth import get_drive_user_credentials
+DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
-@st.cache_resource
-def _drive():
-    creds = get_drive_user_credentials()
-    return build("drive", "v3", credentials=creds)
 
-SUBFOLDERS = {
-    "01_Docs_Cliente": "01_Docs_Cliente",
-    "02_Vehiculos": "02_Vehiculos",
-    "03_Articulos": "03_Articulos",
-    "04_Pedimentos": "04_Pedimentos",
-    "05_PDF_Final": "05_PDF_Final",
-}
+def _gc_sa() -> gspread.Client:
+    sa = st.secrets["gcp_service_account"]
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = SACredentials.from_service_account_info(sa, scopes=scopes)
+    return gspread.authorize(creds)
 
-def create_case_folder(case_id: str, client_name: str, case_date: str) -> str:
-    root_id = st.secrets["DRIVE_ROOT_FOLDER_ID"]
-    safe_name = normalize_name_for_folder(client_name)
-    folder_name = f"{case_date}_{case_id}_{safe_name}"
 
-    service = _drive()
+def _tokens_ws():
+    ss = _gc_sa().open_by_key(st.secrets["SPREADSHEET_ID"])
+    return ss.worksheet("oauth_tokens")
 
-    folder = service.files().create(
-        body={
-            "name": folder_name,
-            "mimeType": "application/vnd.google-apps.folder",
-            "parents": [root_id],
+
+def _get_token_json(key: str) -> dict | None:
+    ws = _tokens_ws()
+    rows = ws.get_all_records()
+    for r in rows:
+        if str(r.get("key", "")).strip() == key:
+            val = str(r.get("value", "")).strip()
+            if val:
+                return json.loads(val)
+    return None
+
+
+def _set_token_json(key: str, token: dict) -> None:
+    ws = _tokens_ws()
+    rows = ws.get_all_records()
+    token_str = json.dumps(token)
+
+    for i, r in enumerate(rows, start=2):
+        if str(r.get("key", "")).strip() == key:
+            ws.update(f"B{i}", [[token_str]])
+            return
+
+    ws.append_row([key, token_str])
+
+
+def _get_query_params() -> dict:
+    try:
+        return dict(st.query_params)
+    except Exception:
+        return st.experimental_get_query_params()
+
+
+def _clear_query_params():
+    try:
+        st.query_params.clear()
+    except Exception:
+        st.experimental_set_query_params()
+
+
+def drive_oauth_ready_ui() -> bool:
+    """
+    UI para autorizar Drive por OAuth (una sola vez).
+    Devuelve True si ya hay token guardado y listo.
+    """
+    token = _get_token_json("drive_token")
+    if token:
+        return True
+
+    st.warning("Drive OAuth no está conectado. Conecta tu Google Drive para poder subir documentos.")
+
+    client_id = st.secrets["google_oauth"]["client_id"]
+    client_secret = st.secrets["google_oauth"]["client_secret"]
+    redirect_uri = st.secrets["google_oauth"]["redirect_uri"]
+
+    flow = Flow.from_client_config(
+        {
+            "web": {
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+            }
         },
-        fields="id",
-        supportsAllDrives=True,
-    ).execute()
-    folder_id = folder["id"]
-
-    for sf in SUBFOLDERS.values():
-        service.files().create(
-            body={
-                "name": sf,
-                "mimeType": "application/vnd.google-apps.folder",
-                "parents": [folder_id],
-            },
-            fields="id",
-            supportsAllDrives=True,
-        ).execute()
-
-    return folder_id
-
-def _find_child_folder(parent_id: str, name: str) -> Optional[str]:
-    service = _drive()
-    q = (
-        f"'{parent_id}' in parents and "
-        f"mimeType='application/vnd.google-apps.folder' and "
-        f"name='{name}' and trashed=false"
+        scopes=DRIVE_SCOPES,
+        redirect_uri=redirect_uri,
     )
-    res = service.files().list(
-        q=q,
-        fields="files(id,name)",
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True,
-    ).execute()
-    files = res.get("files", [])
-    return files[0]["id"] if files else None
 
-def upload_file(case_folder_id: str, file_bytes: bytes, filename: str, subfolder_key: str) -> str:
-    service = _drive()
-    sub_name = SUBFOLDERS.get(subfolder_key, subfolder_key)
-    sub_id = _find_child_folder(case_folder_id, sub_name) or case_folder_id
+    qp = _get_query_params()
+    code = qp.get("code")
+    if isinstance(code, list):
+        code = code[0] if code else None
 
-    media = MediaInMemoryUpload(file_bytes, resumable=False)
-    metadata = {"name": filename, "parents": [sub_id]}
-
-    last_err = None
-    for attempt in range(6):
+    if code:
         try:
-            f = service.files().create(
-                body=metadata,
-                media_body=media,
-                fields="id",
-                supportsAllDrives=True,
-            ).execute()
-            return f["id"]
-        except HttpError as e:
-            last_err = e
-            status = getattr(e.resp, "status", None)
-            if status in (429, 500, 502, 503, 504):
-                time.sleep(min((2 ** attempt) + random.uniform(0, 0.5), 10))
-                continue
-            raise
-    raise last_err
+            flow.fetch_token(code=code)
+            creds = flow.credentials
+            token_payload = {
+                "token": creds.token,
+                "refresh_token": creds.refresh_token,
+                "token_uri": creds.token_uri,
+                "client_id": creds.client_id,
+                "client_secret": creds.client_secret,
+                "scopes": creds.scopes,
+            }
+            _set_token_json("drive_token", token_payload)
+            _clear_query_params()
+            st.success("✅ Drive conectado. Ya puedes subir documentos.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"No pude completar OAuth: {type(e).__name__}: {e}")
+            return False
+
+    auth_url, _ = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",
+    )
+
+    st.markdown("### 1) Haz clic para conectar Drive")
+    st.link_button("Conectar Google Drive", auth_url)
+    st.caption("Después de autorizar, Google te regresará a esta app y se guardará el token.")
+    return False
+
+
+def get_drive_user_credentials() -> UserCredentials:
+    token = _get_token_json("drive_token")
+    if not token:
+        raise RuntimeError("Drive no está conectado por OAuth todavía.")
+
+    creds = UserCredentials(
+        token=token.get("token"),
+        refresh_token=token.get("refresh_token"),
+        token_uri=token.get("token_uri"),
+        client_id=token.get("client_id"),
+        client_secret=token.get("client_secret"),
+        scopes=token.get("scopes"),
+    )
+
+    if not creds.valid:
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            token["token"] = creds.token
+            _set_token_json("drive_token", token)
+
+    return creds
