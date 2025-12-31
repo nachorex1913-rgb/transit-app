@@ -9,7 +9,7 @@ from google.oauth2.credentials import Credentials as UserCredentials
 from google_auth_oauthlib.flow import Flow
 from google.auth.transport.requests import Request
 
-DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
+DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
 def _gc_sa() -> gspread.Client:
     sa = st.secrets["gcp_service_account"]
