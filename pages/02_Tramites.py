@@ -392,4 +392,174 @@ if ocr_btn:
             "method": result.get("method") or "",
         }
 
-ocr_state = st.session_sta
+ocr_state = st.session_state.get("vin_ocr_result", {})
+vin_guess = (ocr_state.get("vin") or "").strip().upper()
+
+vin_input = st.text_input("VIN detectado / VIN manual", value=vin_guess, key="vin_input").strip().upper()
+
+decode_btn = st.button("Decodificar VIN", type="secondary")
+
+decoded = {}
+if decode_btn and vin_input:
+    decoded = _decode_vin(vin_input)
+    st.session_state["vin_decoded"] = decoded
+else:
+    decoded = st.session_state.get("vin_decoded", {}) if vin_input else {}
+
+# Prefill con decoded (si existe)
+brand_pref = decoded.get("brand") or decoded.get("make") or decoded.get("Marca") or ""
+model_pref = decoded.get("model") or decoded.get("Modelo") or ""
+year_pref = str(decoded.get("year") or decoded.get("Año") or "")
+
+f1, f2, f3 = st.columns(3)
+with f1:
+    v_brand = st.text_input("Marca", value=str(brand_pref), key="v_brand")
+with f2:
+    v_model = st.text_input("Modelo", value=str(model_pref), key="v_model")
+with f3:
+    v_year = st.text_input("Año", value=str(year_pref), key="v_year")
+
+f4, f5, f6 = st.columns(3)
+with f4:
+    v_qty = st.number_input("Cantidad", min_value=1, value=1, step=1, key="v_qty")
+with f5:
+    v_weight = st.text_input("Peso (texto libre: lb/kg)", value="", key="v_weight")
+with f6:
+    v_value = st.text_input("Valor (texto libre)", value="", key="v_value")
+
+v_desc = st.text_area("Descripción (opcional)", value="", height=80, key="v_desc")
+
+confirm_vehicle = st.checkbox("Confirmo que el VIN y la información del vehículo son correctos", key="confirm_vehicle")
+
+save_vehicle_btn = st.button("Guardar vehículo en el trámite", type="primary")
+
+if save_vehicle_btn:
+    try:
+        if not vin_input:
+            raise ValueError("VIN requerido.")
+        if not confirm_vehicle:
+            raise ValueError("Debes confirmar la información antes de guardar.")
+
+        item_id = add_vehicle_item(
+            case_id=case_id,
+            vin=vin_input,
+            brand=_normalize_spaces(v_brand),
+            model=_normalize_spaces(v_model),
+            year=_normalize_spaces(v_year),
+            description=_normalize_spaces(v_desc),
+            quantity=int(v_qty),
+            weight=_normalize_spaces(v_weight),
+            value=_normalize_spaces(v_value),
+            source="vin_photo" if vin_photo else "manual",
+        )
+
+        st.success(f"Vehículo guardado. Item ID: {item_id}")
+        st.session_state["vin_ocr_result"] = {"vin": "", "raw": "", "method": ""}
+        st.session_state["vin_decoded"] = {}
+        st.rerun()
+
+    except Exception as e:
+        st.error(f"No se pudo guardar vehículo: {type(e).__name__}: {e}")
+
+# Mostrar raw OCR para auditoría
+if ocr_state.get("raw"):
+    with st.expander("Ver texto OCR (debug)"):
+        st.write(f"Método: {ocr_state.get('method')}")
+        st.text(ocr_state.get("raw", ""))
+
+st.divider()
+
+
+# -------------------------
+# Agregar artículo (dictado + validación)
+# -------------------------
+st.subheader("Agregar artículo (Dictado por voz o manual)")
+
+# Lista VINs del trámite para asociar piezas
+vin_list = []
+if not items_df.empty and "item_type" in items_df.columns:
+    vin_list = items_df.loc[items_df["item_type"] == "vehicle", "unique_key"].astype(str).tolist()
+
+st.caption(
+    "Tip: en el celular usa el mic del teclado para dictar en la caja de texto.\n"
+    "Formato sugerido:\n"
+    "ref: 8891-AX | marca: Milwaukee | modelo: M18 | peso: 3.5 lb | estado: usado | cantidad: 2 | parte_vehiculo: si | vin: 1HG... "
+)
+
+dictation_text = st.text_area("Dictado (texto)", value="", height=90, key="article_dictation")
+parse_btn = st.button("Parsear dictado", type="secondary")
+
+if "article_parsed" not in st.session_state:
+    st.session_state["article_parsed"] = {}
+
+if parse_btn:
+    st.session_state["article_parsed"] = _parse_article_dictation(dictation_text)
+
+parsed = st.session_state.get("article_parsed", {}) or {}
+
+a1, a2, a3 = st.columns(3)
+with a1:
+    a_ref = st.text_input("Referencia/Serie (opcional)", value=parsed.get("ref", ""), key="a_ref")
+with a2:
+    a_brand = st.text_input("Marca", value=parsed.get("brand", ""), key="a_brand")
+with a3:
+    a_model = st.text_input("Modelo", value=parsed.get("model", ""), key="a_model")
+
+b1, b2, b3 = st.columns(3)
+with b1:
+    a_qty = st.number_input("Cantidad", min_value=1, value=int(parsed.get("quantity", "1") or 1), step=1, key="a_qty")
+with b2:
+    a_weight = st.text_input("Peso (texto libre: lb/kg)", value=parsed.get("weight", ""), key="a_weight")
+with b3:
+    a_value = st.text_input("Valor (texto libre)", value=parsed.get("value", ""), key="a_value")
+
+c1, c2, c3 = st.columns(3)
+with c1:
+    a_condition = st.selectbox("Estado", options=["", "nuevo", "usado"], index=0, key="a_condition")
+with c2:
+    a_is_part = st.selectbox("¿Es parte del vehículo?", options=["no", "yes"], index=0, key="a_is_part")
+with c3:
+    # si es parte del vehículo, selecciona VIN padre
+    parent_vin_default = parsed.get("parent_vin", "")
+    parent_vin = st.selectbox("VIN padre (si aplica)", options=[""] + vin_list, index=0, key="a_parent_vin")
+    if parent_vin_default and parent_vin_default in vin_list:
+        parent_vin = parent_vin_default
+
+a_desc = st.text_area("Descripción del artículo", value=parsed.get("description", ""), height=80, key="a_desc")
+
+confirm_article = st.checkbox("Confirmo que la información del artículo es correcta", key="confirm_article")
+save_article_btn = st.button("Guardar artículo en el trámite", type="primary")
+
+if save_article_btn:
+    try:
+        if not confirm_article:
+            raise ValueError("Debes confirmar la información antes de guardar.")
+        if not _normalize_spaces(a_desc) and not _normalize_spaces(a_ref):
+            raise ValueError("Debes incluir al menos una descripción o una referencia/serie.")
+
+        # tags dentro de description (sin tocar DB aún)
+        desc_final = _build_article_description(
+            base_desc=a_desc,
+            ref=a_ref,
+            condition=a_condition,
+            is_vehicle_part=a_is_part,
+            parent_vin=(parent_vin if a_is_part == "yes" else ""),
+        )
+
+        item_id = add_article_item(
+            case_id=case_id,
+            description=desc_final,
+            brand=_normalize_spaces(a_brand),
+            model=_normalize_spaces(a_model),
+            quantity=int(a_qty),
+            weight=_normalize_spaces(a_weight),
+            value=_normalize_spaces(a_value),
+            source="voice_dictation" if dictation_text.strip() else "manual",
+        )
+
+        st.success(f"Artículo guardado. Item ID: {item_id}")
+        st.session_state["article_parsed"] = {}
+        st.rerun()
+
+    except Exception as e:
+        st.error(f"No se pudo guardar artículo: {type(e).__name__}: {e}")
