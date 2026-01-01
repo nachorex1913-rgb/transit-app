@@ -1,3 +1,13 @@
+import pytesseract
+import streamlit as st
+
+try:
+    v = pytesseract.get_tesseract_version()
+    st.success(f"Tesseract instalado ✅ — versión: {v}")
+except Exception as e:
+    st.error(f"Tesseract NO instalado ❌ — {e}")
+
+
 import re
 import streamlit as st
 from datetime import datetime
