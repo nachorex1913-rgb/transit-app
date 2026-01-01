@@ -18,3 +18,5 @@ requests
 pytesseract
 pillow
 
+pytesseract
+pillow
