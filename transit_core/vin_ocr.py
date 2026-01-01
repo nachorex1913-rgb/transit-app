@@ -3,38 +3,33 @@ from __future__ import annotations
 
 import re
 from io import BytesIO
-from typing import Dict, Any, List
+from typing import List, Dict, Any, Optional, Tuple
 
 from PIL import Image, ImageOps, ImageEnhance
 
-# VIN real: 17 chars, normalmente sin I/O/Q
-VIN_STRICT = re.compile(r"^[A-HJ-NPR-Z0-9]{17}$")
+from transit_core.validators import is_valid_vin_strict
+
+VIN_CAND_RE = re.compile(r"[A-Z0-9]{17}")
 
 
 def _preprocess(img: Image.Image) -> Image.Image:
     g = ImageOps.grayscale(img)
     g = ImageOps.autocontrast(g)
-    # agranda para VIN pequeño
     g = g.resize((g.size[0] * 2, g.size[1] * 2))
     g = ImageEnhance.Contrast(g).enhance(2.2)
     g = ImageEnhance.Sharpness(g).enhance(2.0)
     return g
 
 
-def _normalize_ocr_text(t: str) -> str:
+def _normalize_text(t: str) -> str:
     t = (t or "").upper()
-    # deja alfanum y separadores simples
     t = re.sub(r"[^A-Z0-9\s]", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
 
-def _fix_common_ocr_mistakes(s: str) -> str:
-    """
-    Correcciones típicas OCR:
-      O->0, I->1, Q->0, S->5, B->8, Z->2
-    OJO: no siempre es correcto, por eso generamos variantes.
-    """
+def _fix_common_ocr(s: str) -> str:
+    # variantes típicas OCR
     return (
         s.replace("O", "0")
          .replace("Q", "0")
@@ -45,63 +40,100 @@ def _fix_common_ocr_mistakes(s: str) -> str:
     )
 
 
-def _extract_candidates(text: str) -> List[str]:
-    """
-    Extrae candidatos VIN desde texto OCR:
-    - busca grupos alfanuméricos largos
-    - usa sliding window de 17
-    - genera variantes con correcciones OCR
-    """
-    t = _normalize_ocr_text(text)
-
-    # juntamos todo sin espacios para sliding
+def _extract_candidates(raw_text: str) -> List[str]:
+    t = _normalize_text(raw_text)
     compact = re.sub(r"\s+", "", t)
 
-    candidates = []
+    cands = []
+    for m in VIN_CAND_RE.finditer(compact):
+        cands.append(m.group(0))
 
-    # 1) tokens alfanuméricos >= 17
-    tokens = re.findall(r"[A-Z0-9]{8,}", compact)
-    for tok in tokens:
-        if len(tok) < 17:
-            continue
-        for i in range(0, len(tok) - 16):
-            candidates.append(tok[i:i+17])
-
-    # 2) también sliding sobre todo el texto compactado
-    if len(compact) >= 17:
-        for i in range(0, min(len(compact) - 16, 300)):  # límite para no explotar
-            candidates.append(compact[i:i+17])
-
-    # genera variantes corregidas
+    # variantes corregidas
     expanded = []
-    for c in candidates:
+    for c in cands:
         expanded.append(c)
-        expanded.append(_fix_common_ocr_mistakes(c))
+        expanded.append(_fix_common_ocr(c))
 
-    # filtra por formato VIN
+    # unique + estrictas
     out = []
     seen = set()
     for c in expanded:
         c = c.strip().upper()
-        if len(c) != 17:
-            continue
-        # intentamos estricto y también uno "casi" (si viene con I/O/Q lo arreglamos arriba)
-        if VIN_STRICT.match(c):
-            if c not in seen:
-                seen.add(c)
-                out.append(c)
+        if len(c) == 17 and c not in seen:
+            seen.add(c)
+            out.append(c)
 
-    return out[:10]
+    return out[:20]
+
+
+def _find_roi_box_from_ocr_data(data_rows: List[Dict[str, Any]]) -> Optional[Tuple[int, int, int, int]]:
+    """
+    Busca las palabras 'VEHICLE', 'ID', 'NUMBER' para ubicar el área y luego
+    devolver un ROI debajo donde usualmente está el VIN.
+    """
+    words = []
+    for r in data_rows:
+        txt = (r.get("text") or "").strip().upper()
+        if not txt:
+            continue
+        try:
+            conf = float(r.get("conf", -1))
+        except Exception:
+            conf = -1
+        if conf < 40:  # descarta basura
+            continue
+        words.append({
+            "text": txt,
+            "left": int(r["left"]),
+            "top": int(r["top"]),
+            "width": int(r["width"]),
+            "height": int(r["height"]),
+        })
+
+    if not words:
+        return None
+
+    # encuentra tokens clave
+    key_idxs = []
+    for i, w in enumerate(words):
+        if w["text"] in ("VEHICLE", "VEHICLEID", "VEHICLEIDNUMBER"):
+            key_idxs.append(i)
+
+    # Plan A: si aparece VEHICLE, construimos ROI con las siguientes palabras cercanas
+    if key_idxs:
+        i0 = key_idxs[0]
+        base = words[i0]
+        x1 = base["left"]
+        y1 = base["top"]
+        x2 = base["left"] + base["width"]
+        y2 = base["top"] + base["height"]
+
+        # expande buscando palabras cerca en la misma línea
+        for w in words:
+            if abs(w["top"] - base["top"]) <= 20:
+                x1 = min(x1, w["left"])
+                x2 = max(x2, w["left"] + w["width"])
+                y1 = min(y1, w["top"])
+                y2 = max(y2, w["top"] + w["height"])
+
+        # ROI debajo de esa línea (donde está el VIN)
+        roi_top = y2 + 5
+        roi_bottom = roi_top + 140  # suficiente para 1-2 líneas
+        roi_left = max(0, x1 - 30)
+        roi_right = x2 + 450  # VIN suele estar a la derecha
+        return (roi_left, roi_top, roi_right, roi_bottom)
+
+    return None
 
 
 def extract_vin_from_image(image_bytes: bytes) -> dict:
     """
     Return:
       {
-        "vin": "...",
+        "vin": "",
         "confidence": 0.0-1.0,
-        "raw_text": "...",
-        "candidates": [...]
+        "raw_text": "",
+        "candidates": []
       }
     """
     if not image_bytes:
@@ -109,43 +141,75 @@ def extract_vin_from_image(image_bytes: bytes) -> dict:
 
     try:
         import pytesseract
-    except Exception:
-        return {"vin": "", "confidence": 0.0, "raw_text": "pytesseract no instalado.", "candidates": []}
+        from pytesseract import Output
+    except Exception as e:
+        return {"vin": "", "confidence": 0.0, "raw_text": f"OCR import error: {e}", "candidates": []}
 
     img = Image.open(BytesIO(image_bytes)).convert("RGB")
     img2 = _preprocess(img)
 
-    # whitelist para VIN
     whitelist = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
     base_cfg = f"-c tessedit_char_whitelist={whitelist}"
 
-    # probamos varios PSM (según layout de la foto)
+    # 1) Primero obtenemos data para ubicar ROI
+    try:
+        d = pytesseract.image_to_data(img2, config=f"--oem 3 --psm 6 {base_cfg}", output_type=Output.DICT)
+        rows = []
+        n = len(d.get("text", []))
+        for i in range(n):
+            rows.append({
+                "text": d["text"][i],
+                "conf": d["conf"][i],
+                "left": d["left"][i],
+                "top": d["top"][i],
+                "width": d["width"][i],
+                "height": d["height"][i],
+            })
+        roi = _find_roi_box_from_ocr_data(rows)
+    except Exception:
+        roi = None
+
+    # 2) OCR en ROI si existe; si no, OCR global
+    ocr_targets = []
+    if roi:
+        l, t, r, b = roi
+        # clamp
+        l = max(0, l); t = max(0, t)
+        r = min(img2.size[0], r); b = min(img2.size[1], b)
+        if r > l and b > t:
+            ocr_targets.append(img2.crop((l, t, r, b)))
+
+    if not ocr_targets:
+        ocr_targets.append(img2)
+
     configs = [
-        f"--oem 3 --psm 7 {base_cfg}",   # una línea
+        f"--oem 3 --psm 7 {base_cfg}",   # 1 línea
         f"--oem 3 --psm 6 {base_cfg}",   # bloque
-        f"--oem 3 --psm 11 {base_cfg}",  # texto disperso
+        f"--oem 3 --psm 11 {base_cfg}",  # disperso
     ]
 
-    best = {"vin": "", "raw_text": "", "candidates": [], "confidence": 0.0}
+    best_raw = ""
+    best_candidates = []
 
-    for cfg in configs:
-        try:
-            raw = pytesseract.image_to_string(img2, config=cfg) or ""
+    for target in ocr_targets:
+        for cfg in configs:
+            raw = ""
+            try:
+                raw = pytesseract.image_to_string(target, config=cfg) or ""
+            except Exception:
+                continue
+
+            if len(raw) > len(best_raw):
+                best_raw = raw
+
             cands = _extract_candidates(raw)
-
             if cands:
-                # si encontramos candidatos, el primero es el "mejor" por orden
-                vin = cands[0]
-                # confianza heurística: mejor si aparece varias veces
-                conf = 0.92 if len(cands) >= 2 else 0.85
-                return {"vin": vin, "confidence": conf, "raw_text": raw, "candidates": cands}
+                best_candidates = cands
+                # prioriza estrictos (check digit)
+                strict = [c for c in cands if is_valid_vin_strict(c)]
+                if strict:
+                    return {"vin": strict[0], "confidence": 0.92, "raw_text": raw, "candidates": strict[:10]}
+                # si no hay estrictos, devuelve candidatos igual
+                return {"vin": cands[0], "confidence": 0.60, "raw_text": raw, "candidates": cands[:10]}
 
-            # guarda el raw más “largo” para debug
-            if len(raw) > len(best["raw_text"]):
-                best["raw_text"] = raw
-
-        except Exception as e:
-            # seguimos intentando otros configs
-            best["raw_text"] = best["raw_text"] or f"OCR error: {type(e).__name__}: {e}"
-
-    return best
+    return {"vin": "", "confidence": 0.0, "raw_text": best_raw, "candidates": best_candidates}
