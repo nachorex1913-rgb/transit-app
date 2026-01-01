@@ -74,6 +74,18 @@ def _worksheets_map() -> dict[str, gspread.Worksheet]:
     raise RuntimeError(f"Error obteniendo worksheets metadata: {last_err}") from last_err
 
 
+def _safe_get_row1(ws: gspread.Worksheet) -> list[str]:
+    last_err = None
+    for attempt in range(6):
+        try:
+            vals = ws.get("1:1")
+            return vals[0] if vals and len(vals) > 0 else []
+        except gspread.exceptions.APIError as e:
+            last_err = e
+            time.sleep(min((2 ** attempt) + random.uniform(0, 0.5), 10))
+    raise RuntimeError(f"Error leyendo headers (1:1) en '{ws.title}': {last_err}") from last_err
+
+
 def init_db(force: bool = False) -> None:
     if not force and st.session_state.get("_transit_db_inited", False):
         return
@@ -97,7 +109,6 @@ def init_db(force: bool = False) -> None:
                 raise RuntimeError(f"No se pudo crear worksheet '{tab}': {last_err}") from last_err
         else:
             ws = wmap[tab]
-            # Evita row_values(1) (más propenso a fallos); usa get('1:1') con retry
             first_row = _safe_get_row1(ws)
             if not first_row:
                 ws.append_row(headers)
@@ -107,18 +118,6 @@ def init_db(force: bool = False) -> None:
                     ws.update("1:1", [first_row + missing])
 
     st.session_state["_transit_db_inited"] = True
-
-
-def _safe_get_row1(ws: gspread.Worksheet) -> list[str]:
-    last_err = None
-    for attempt in range(6):
-        try:
-            vals = ws.get("1:1")
-            return vals[0] if vals and len(vals) > 0 else []
-        except gspread.exceptions.APIError as e:
-            last_err = e
-            time.sleep(min((2 ** attempt) + random.uniform(0, 0.5), 10))
-    raise RuntimeError(f"Error leyendo headers (1:1) en '{ws.title}': {last_err}") from last_err
 
 
 def _ws(tab: str) -> gspread.Worksheet:
@@ -143,11 +142,7 @@ def _get_all_records(tab: str) -> list[dict[str, Any]]:
             last_err = e
             time.sleep(min((2 ** attempt) + random.uniform(0, 0.5), 10))
     header = _safe_get_row1(ws)
-    raise RuntimeError(
-        f"Error leyendo tab '{tab}'. Revisa headers en fila 1.\n"
-        f"Headers actuales: {header}\n"
-        f"Detalle: {last_err}"
-    )
+    raise RuntimeError(f"Error leyendo tab '{tab}'. Headers: {header}. Detalle: {last_err}") from last_err
 
 
 def _append(tab: str, row: list[Any]) -> None:
@@ -171,6 +166,9 @@ def _col_letter(n: int) -> str:
     return s
 
 
+# -----------------------------
+# CLIENTS
+# -----------------------------
 def list_clients() -> pd.DataFrame:
     init_db()
     return pd.DataFrame(_get_all_records("clients"))
@@ -182,6 +180,20 @@ def get_client(client_id: str) -> dict[str, Any] | None:
         if str(r.get("client_id","")) == str(client_id):
             return r
     return None
+
+
+def search_clients(query: str) -> pd.DataFrame:
+    """
+    ✅ Esta función es la que tu 01_Clientes.py está importando.
+    """
+    df = list_clients()
+    if df.empty:
+        return df
+    q = (query or "").strip().lower()
+    if not q:
+        return df
+    mask = df.apply(lambda r: q in str(r.to_dict()).lower(), axis=1)
+    return df[mask]
 
 
 def upsert_client(
@@ -200,6 +212,7 @@ def upsert_client(
     now = _now_iso()
     headers = SHEETS["clients"]
 
+    # Update
     if client_id:
         for i, r in enumerate(records, start=2):
             if str(r.get("client_id","")) == client_id:
@@ -218,17 +231,27 @@ def upsert_client(
                 _update_row_by_headers(ws, i, headers, updated)
                 return client_id
 
+    # Insert
     max_n = 0
     for r in records:
         cid = str(r.get("client_id","")).strip()
         if cid.startswith("CL-") and cid[3:].isdigit():
             max_n = max(max_n, int(cid[3:]))
+
     new_id = f"CL-{max_n+1:06d}"
     row = [new_id, name, address, id_type, id_number, phone, email, country_destination, now, now]
     _append("clients", row)
     return new_id
 
 
+def _update_row_by_headers(ws: gspread.Worksheet, row_index: int, headers: list[str], record: dict[str, Any]):
+    end_col = _col_letter(len(headers))
+    ws.update(f"A{row_index}:{end_col}{row_index}", [[record.get(h, "") for h in headers]])
+
+
+# -----------------------------
+# CASES
+# -----------------------------
 def list_cases() -> pd.DataFrame:
     init_db()
     return pd.DataFrame(_get_all_records("cases"))
@@ -253,19 +276,15 @@ def create_case(
     now = _now_iso()
     cdate = case_date or datetime.now().date().isoformat()
 
-    row = [
-        case_id, client_id, cdate, status, origin, destination, notes,
-        drive_folder_id or "", now, now, "", ""
-    ]
+    row = [case_id, client_id, cdate, status, origin, destination, notes, drive_folder_id or "", now, now, "", ""]
     _append("cases", row)
     return case_id
-
 
 
 def get_case(case_id: str) -> dict[str, Any] | None:
     init_db()
     for r in _get_all_records("cases"):
-        if str(r.get("case_id","")) == case_id:
+        if str(r.get("case_id","")) == str(case_id):
             return r
     return None
 
@@ -274,24 +293,15 @@ def update_case_fields(case_id: str, fields: dict) -> None:
     init_db()
     ws = _ws("cases")
     headers = _safe_get_row1(ws)
+
     if "case_id" not in headers:
-        raise RuntimeError("La hoja 'cases' no tiene columna case_id en headers.")
+        raise RuntimeError("La hoja 'cases' no tiene columna case_id.")
 
     col_case_id = headers.index("case_id") + 1
-
-    last_err = None
-    for attempt in range(6):
-        try:
-            cell = ws.find(case_id, in_column=col_case_id)
-            if not cell:
-                raise ValueError(f"case_id no encontrado: {case_id}")
-            row = cell.row
-            break
-        except gspread.exceptions.APIError as e:
-            last_err = e
-            time.sleep(min((2 ** attempt) + random.uniform(0, 0.5), 10))
-    else:
-        raise RuntimeError(f"Error buscando case_id '{case_id}': {last_err}") from last_err
+    cell = ws.find(case_id, in_column=col_case_id)
+    if not cell:
+        raise ValueError(f"case_id no encontrado: {case_id}")
+    row = cell.row
 
     updates = []
     for k, v in fields.items():
@@ -303,18 +313,12 @@ def update_case_fields(case_id: str, fields: dict) -> None:
         return
 
     payload = [{"range": f"{_col_letter(c)}{r}", "values": [[val]]} for (r, c, val) in updates]
-
-    last_err = None
-    for attempt in range(6):
-        try:
-            ws.batch_update(payload)
-            return
-        except gspread.exceptions.APIError as e:
-            last_err = e
-            time.sleep(min((2 ** attempt) + random.uniform(0, 0.5), 10))
-    raise RuntimeError(f"Error batch_update en 'cases': {last_err}") from last_err
+    ws.batch_update(payload)
 
 
+# -----------------------------
+# ITEMS
+# -----------------------------
 def list_items(case_id: Optional[str] = None) -> pd.DataFrame:
     init_db()
     df = pd.DataFrame(_get_all_records("items"))
@@ -356,6 +360,7 @@ def add_vehicle_item(
     existing_item_ids = [r.get("item_id","") for r in items_ws.get_all_records()]
     item_id = next_item_id(existing_item_ids)
     now = _now_iso()
+
     row = [item_id, case_id, "vehicle", v, brand, model, year, description, int(quantity or 1), weight, value, source, now]
     _append("items", row)
     return item_id
@@ -380,11 +385,15 @@ def add_article_item(
     item_id = next_item_id(existing_item_ids)
     seq = next_article_seq(existing_keys, case_id=case_id)
     now = _now_iso()
+
     row = [item_id, case_id, "article", seq, brand, model, "", description, int(quantity or 1), weight, value, source, now]
     _append("items", row)
     return item_id
 
 
+# -----------------------------
+# DOCUMENTS
+# -----------------------------
 def list_documents(case_id: str) -> pd.DataFrame:
     init_db()
     df = pd.DataFrame(_get_all_records("documents"))
