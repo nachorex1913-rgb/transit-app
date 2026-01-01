@@ -40,12 +40,16 @@ def upload_to_drive_via_script(folder_id: str, file_name: str, mime_type: str, f
     return data["file_id"]
 
 
-def create_case_folder_via_script(root_folder_id: str, case_id: str) -> dict:
-    data = _post({
+def create_case_folder_via_script(root_folder_id: str, case_id: str, folder_name: str | None = None) -> dict:
+    payload = {
         "action": "create_case_folder",
         "root_folder_id": root_folder_id,
         "case_id": case_id,
-    })
+    }
+    if folder_name:
+        payload["folder_name"] = folder_name
+
+    data = _post(payload, timeout=90)
     return {
         "folder_id": data["folder_id"],
         "folder_url": data.get("folder_url"),
