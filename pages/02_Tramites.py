@@ -234,6 +234,13 @@ if ocr_btn and vin_image is not None:
         except Exception as e:
             st.error(f"OCR error: {type(e).__name__}: {e}")
 
+res = extract_vin_from_image(vin_image.getvalue())
+
+with st.expander("🧪 Debug OCR (texto leído por Tesseract)"):
+    st.text(res.get("raw_text", ""))
+    st.write("Candidatos VIN:", res.get("candidates", []))
+
+
 vin_guess = st.session_state["vin_ocr_result"]["vin"]
 conf = st.session_state["vin_ocr_result"]["confidence"]
 
