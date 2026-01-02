@@ -1,4 +1,5 @@
 import re
+import hashlib
 import streamlit as st
 from datetime import datetime
 
@@ -21,7 +22,61 @@ st.set_page_config(page_title="Trámites", layout="wide")
 st.title("Trámites")
 
 
+# ------------------------------------
+# Helpers (dictado + dedupe)
+# ------------------------------------
+def _norm_text(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def _make_article_fingerprint(
+    case_id: str,
+    ref: str,
+    brand: str,
+    model: str,
+    weight: str,
+    condition: str,
+    quantity: int,
+    is_vehicle_part: bool,
+    parent_vin: str,
+    description: str,
+    value: str,
+) -> str:
+    payload = "|".join([
+        _norm_text(case_id),
+        _norm_text(ref).lower(),
+        _norm_text(brand).lower(),
+        _norm_text(model).lower(),
+        _norm_text(weight).lower(),
+        _norm_text(condition).lower(),
+        str(int(quantity or 1)),
+        "1" if is_vehicle_part else "0",
+        _norm_text(parent_vin).upper(),
+        _norm_text(description).lower(),
+        _norm_text(value).lower(),
+    ])
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+def _exists_article_duplicate(items_df, fingerprint: str) -> bool:
+    """
+    Busca en items_df un fingerprint exacto, si existe la columna.
+    Si no existe, no bloqueamos por DF (bloqueamos por last_saved_fingerprint en session_state).
+    """
+    if items_df is None or items_df.empty:
+        return False
+    if "fingerprint" in items_df.columns:
+        return any(str(x) == fingerprint for x in items_df["fingerprint"].tolist())
+    return False
+
+
 def _parse_article_dictation(text: str) -> dict:
+    """
+    Soporta:
+    - Formato con ":"  -> ref: 123 | marca: X | modelo: Y
+    - Formato sin ":"  -> ref 123 marca X modelo Y peso 95 lb cantidad 2 ...
+    Separadores: |  ;  saltos de línea
+    """
     t = (text or "").strip()
     data = {
         "ref": "",
@@ -38,7 +93,86 @@ def _parse_article_dictation(text: str) -> dict:
     if not t:
         return data
 
+    # 1) Primero intentamos por bloques (|, \n, ;)
     parts = [p.strip() for p in re.split(r"\||\n|;", t) if p.strip()]
+
+    # Si no hay ":" en ningún lado, intentamos parseo "clave valor" en toda la cadena
+    has_colon = any(":" in p for p in parts)
+    if not has_colon:
+        # Diccionario de alias -> key normalizada
+        aliases = {
+            "ref": "ref", "referencia": "ref", "serie": "ref", "serial": "ref",
+            "marca": "brand", "brand": "brand",
+            "modelo": "model", "model": "model",
+            "peso": "weight", "weight": "weight",
+            "estado": "condition", "condition": "condition",
+            "cantidad": "quantity", "qty": "quantity", "quantity": "quantity",
+            "parte_vehiculo": "is_vehicle_part", "partevehiculo": "is_vehicle_part",
+            "parte": "is_vehicle_part", "vehicle_part": "is_vehicle_part",
+            "vin": "parent_vin", "vin_padre": "parent_vin", "parent_vin": "parent_vin",
+            "descripcion": "description", "description": "description",
+            "valor": "value", "value": "value",
+        }
+
+        tokens = re.split(r"\s+", t.strip())
+        i = 0
+        current_key = None
+        buff = []
+
+        def flush():
+            nonlocal current_key, buff
+            if not current_key:
+                buff = []
+                return
+            val = " ".join(buff).strip()
+            key = current_key
+            # asignar
+            if key == "ref":
+                data["ref"] = val
+            elif key == "brand":
+                data["brand"] = val
+            elif key == "model":
+                data["model"] = val
+            elif key == "weight":
+                data["weight"] = val
+            elif key == "condition":
+                data["condition"] = val
+            elif key == "quantity":
+                try:
+                    data["quantity"] = int(re.findall(r"\d+", val)[0])
+                except Exception:
+                    data["quantity"] = 1
+            elif key == "is_vehicle_part":
+                data["is_vehicle_part"] = val.lower() in ("si", "sí", "yes", "true", "1")
+            elif key == "parent_vin":
+                data["parent_vin"] = normalize_vin(val)
+            elif key == "description":
+                data["description"] = val
+            elif key == "value":
+                data["value"] = val
+            buff = []
+
+        while i < len(tokens):
+            tok = tokens[i].strip().lower()
+            tok_clean = re.sub(r"[^\wáéíóúüñ_]+", "", tok)
+
+            if tok_clean in aliases:
+                # flush anterior
+                flush()
+                current_key = aliases[tok_clean]
+                buff = []
+            else:
+                buff.append(tokens[i])
+            i += 1
+        flush()
+
+        if not data["description"]:
+            desc = " | ".join([x for x in [data["ref"], data["brand"], data["model"], data["condition"]] if x])
+            data["description"] = desc.strip()
+
+        return data
+
+    # 2) Parseo clásico con ":" por partes
     if len(parts) == 1 and ":" not in parts[0]:
         data["description"] = parts[0]
         return data
@@ -277,9 +411,6 @@ st.write(f"**Confianza OCR:** {conf:.2f}")
 if vin_input_norm and len(vin_input_norm) == 17 and not is_valid_vin(vin_input_norm):
     st.warning("VIN inválido (contiene I/O/Q o caracteres no permitidos). Verifica antes de guardar.")
 
-with st.expander("🧪 Debug Decode"):
-    st.json(decoded)
-
 if veh_brand_key not in st.session_state:
     st.session_state[veh_brand_key] = ""
 if veh_model_key not in st.session_state:
@@ -346,11 +477,19 @@ if st.button("Guardar vehículo", type="primary", disabled=not confirm_vehicle, 
 st.divider()
 st.subheader("Agregar artículo (dictado)")
 
+# Mensaje persistente de guardado (anti “no vi nada”)
+last_msg_key = f"art_last_save_msg_{case_id}"
+if last_msg_key in st.session_state and st.session_state[last_msg_key]:
+    st.success(st.session_state[last_msg_key])
+
 st.caption(
-    "Formato sugerido: ref: XXX | marca: YYY | modelo: ZZZ | peso: 3.5 lb | estado: usado | cantidad: 2 | parte_vehiculo: si | vin: 1HG..."
+    "Formato sugerido: ref: 440827 | marca: Sienna | modelo: Sleep4415 | peso: 95 lb | estado: usado | cantidad: 1 | parte_vehiculo: no | valor: 120"
+)
+st.caption(
+    "También puedes dictar continuo sin ':' así: ref 440827 marca Sienna modelo Sleep4415 peso 95 lb estado usado cantidad 1 parte_vehiculo no valor 120"
 )
 
-# Keys consistentes (para poder escribir en session_state y que sí llene)
+# Keys
 art_ref_key = f"art_ref_{case_id}"
 art_brand_key = f"art_brand_{case_id}"
 art_model_key = f"art_model_{case_id}"
@@ -361,31 +500,23 @@ art_qty_key = f"art_qty_{case_id}"
 art_is_part_key = f"art_is_part_{case_id}"
 art_parent_vin_txt_key = f"art_parent_vin_txt_{case_id}"
 art_parent_vin_sel_key = f"art_parent_vin_sel_{case_id}"
+art_last_fpr_key = f"art_last_fingerprint_{case_id}"
 
-# Inicializar defaults SOLO si no existen
-if art_ref_key not in st.session_state:
-    st.session_state[art_ref_key] = ""
-if art_brand_key not in st.session_state:
-    st.session_state[art_brand_key] = ""
-if art_model_key not in st.session_state:
-    st.session_state[art_model_key] = ""
-if art_weight_key not in st.session_state:
-    st.session_state[art_weight_key] = ""
-if art_value_key not in st.session_state:
-    st.session_state[art_value_key] = ""
-if art_desc_key not in st.session_state:
-    st.session_state[art_desc_key] = ""
-if art_qty_key not in st.session_state:
-    st.session_state[art_qty_key] = 1
-if art_is_part_key not in st.session_state:
-    st.session_state[art_is_part_key] = False
-if art_parent_vin_txt_key not in st.session_state:
-    st.session_state[art_parent_vin_txt_key] = ""
+# Defaults
+st.session_state.setdefault(art_ref_key, "")
+st.session_state.setdefault(art_brand_key, "")
+st.session_state.setdefault(art_model_key, "")
+st.session_state.setdefault(art_weight_key, "")
+st.session_state.setdefault(art_value_key, "")
+st.session_state.setdefault(art_desc_key, "")
+st.session_state.setdefault(art_qty_key, 1)
+st.session_state.setdefault(art_is_part_key, False)
+st.session_state.setdefault(art_parent_vin_txt_key, "")
+st.session_state.setdefault(art_last_fpr_key, "")
 
 dictation = st.text_area("Dictado (o escribe manual)", height=90, key=f"art_dict_{case_id}")
 parsed = _parse_article_dictation(dictation)
 
-# Botón que realmente hace que el dictado “sirva”
 apply_dict_btn = st.button("Aplicar dictado a campos", key=f"apply_dict_{case_id}")
 
 if apply_dict_btn:
@@ -446,6 +577,8 @@ if is_part:
             "VIN del vehículo (no hay vehículos registrados aún)",
             key=art_parent_vin_txt_key
         )
+else:
+    parent_vin = st.session_state.get(art_parent_vin_txt_key, "")
 
 art_value = st.text_input("Valor (USD)", key=art_value_key)
 art_description = st.text_area("Descripción", height=80, key=art_desc_key)
@@ -458,18 +591,46 @@ confirm_article = st.checkbox(
 
 if st.button("Guardar artículo", type="primary", disabled=not confirm_article, key=f"save_article_{case_id}"):
     try:
+        # Construir descripción final
         desc = (art_description or "").strip()
 
+        pv_norm = normalize_vin(parent_vin) if is_part else ""
         if is_part:
-            pv = normalize_vin(parent_vin)
-            if pv and len(pv) == 17 and is_valid_vin(pv):
-                desc = f"[PARTE_DE_VEHICULO:{pv}] {desc}".strip()
+            if pv_norm and len(pv_norm) == 17 and is_valid_vin(pv_norm):
+                desc = f"[PARTE_DE_VEHICULO:{pv_norm}] {desc}".strip()
             else:
                 desc = f"[PARTE_DE_VEHICULO] {desc}".strip()
 
         if art_ref and art_ref not in desc:
             desc = f"{art_ref} | {desc}".strip(" |")
 
+        # Fingerprint anti-duplicado
+        fpr = _make_article_fingerprint(
+            case_id=case_id,
+            ref=art_ref,
+            brand=art_brand,
+            model=art_model,
+            weight=art_weight,
+            condition=art_condition,
+            quantity=int(art_qty),
+            is_vehicle_part=bool(is_part),
+            parent_vin=pv_norm,
+            description=desc,
+            value=art_value,
+        )
+
+        # Bloqueo 1: doble click / mismo envío inmediato
+        if st.session_state.get(art_last_fpr_key, "") == fpr:
+            st.warning("Este artículo ya se guardó (misma captura). No se guardó de nuevo.")
+            st.stop()
+
+        # Bloqueo 2: si ya existe en items_df con fingerprint (si tu DB lo soporta)
+        if _exists_article_duplicate(items_df, fpr):
+            st.warning("Este artículo ya existe en el trámite. No se guardó de nuevo.")
+            st.session_state[art_last_fpr_key] = fpr
+            st.stop()
+
+        # Guardar
         add_article_item(
             case_id=case_id,
             description=desc,
@@ -479,9 +640,14 @@ if st.button("Guardar artículo", type="primary", disabled=not confirm_article, 
             weight=art_weight,
             value=art_value,
             source="voice" if dictation.strip() else "manual",
+            # Si tu DB/Sheet aún no tiene esta columna, no pasa nada si add_article_item ignora extras.
+            fingerprint=fpr,
         )
 
-        st.success("Artículo guardado.")
+        # Mensaje persistente + anti-doble click
+        st.session_state[art_last_fpr_key] = fpr
+        st.session_state[last_msg_key] = f"✅ Artículo guardado correctamente: {art_ref or '(sin ref)'} — {art_brand} {art_model}".strip()
+        st.success(st.session_state[last_msg_key])
         st.rerun()
 
     except Exception as e:
