@@ -25,9 +25,6 @@ st.set_page_config(page_title="Trámites", layout="wide")
 st.title("Trámites")
 
 
-# ======================================================
-# Helpers artículos
-# ======================================================
 def _parse_article_dictation(text: str) -> dict:
     t = (text or "").strip()
     data = {
@@ -137,9 +134,6 @@ def _build_article_description(art_type, ref, brand, model, weight, condition, q
     return " | ".join(parts).strip()
 
 
-# ======================================================
-# Tabs
-# ======================================================
 tab_create, tab_manage, tab_list = st.tabs(
     ["➕ Crear trámite", "🛠 Gestionar / Modificar", "📋 Listado + Estatus"]
 )
@@ -170,7 +164,7 @@ with tab_create:
         destination = st.text_input("Destino", value="Guatemala", key="create_case_dest")
 
     notes = st.text_input("Notas (opcional)", value="", key="create_case_notes")
-    st.info(f"📌 Nombre visible del trámite (obligatorio): **{client_name}**")
+    st.info(f"📌 Nombre del trámite (obligatorio): **{client_name}**")
 
     if st.button("Crear trámite", type="primary", key="create_case_btn"):
         try:
@@ -214,6 +208,11 @@ with tab_manage:
         st.info("No hay trámites aún.")
         st.stop()
 
+    clients_df = list_clients().fillna("")
+    client_map = {}
+    if not clients_df.empty and "client_id" in clients_df.columns and "name" in clients_df.columns:
+        client_map = dict(zip(clients_df["client_id"].astype(str), clients_df["name"].astype(str)))
+
     for col in ["case_name", "status"]:
         if col not in cases_df.columns:
             cases_df[col] = ""
@@ -221,7 +220,6 @@ with tab_manage:
     cases_df["status"] = cases_df["status"].astype(str).str.upper().str.strip()
     cases_df.loc[cases_df["status"] == "", "status"] = "BORRADOR"
 
-    # ---- Seguridad edición trámites no borrador
     edit_locked_cases = st.toggle("Editar trámites PENDIENTE/ENVIADO (requiere código)", value=False, key="toggle_edit_locked")
     authorized = False
     if edit_locked_cases:
@@ -230,16 +228,15 @@ with tab_manage:
         if not authorized and code:
             st.error("Código incorrecto.")
         if authorized:
-            st.success("Autorización válida. Edición habilitada para pendientes/enviados.")
+            st.success("Autorización válida. Edición habilitada.")
 
-    # ---- Selector SOLO borrador por defecto
     if authorized:
         selectable_df = cases_df.copy()
     else:
         selectable_df = cases_df[cases_df["status"] == "BORRADOR"].copy()
 
     if selectable_df.empty:
-        st.warning("No hay trámites en BORRADOR para gestionar (o no tienes autorización para ver pendientes/enviados).")
+        st.warning("No hay trámites en BORRADOR para gestionar (o no tienes autorización).")
         st.stop()
 
     selectable_df["label"] = (
@@ -260,9 +257,15 @@ with tab_manage:
         st.stop()
 
     case_id = str(case.get("case_id") or "")
-    case_name = str(case.get("case_name") or "")
+    case_name = str(case.get("case_name") or "").strip()
     case_status = str(case.get("status") or "BORRADOR").upper().strip()
     drive_folder_id = str(case.get("drive_folder_id") or "")
+    client_id = str(case.get("client_id") or "")
+    client_name = client_map.get(client_id, "").strip()
+
+    if not case_name:
+        # fallback visual si por algún caso viejo no tiene case_name
+        case_name = client_name
 
     items_df = list_items(case_id=case_id)
     items_df = items_df.fillna("") if items_df is not None else items_df
@@ -270,13 +273,32 @@ with tab_manage:
     st.write(f"**Trámite:** {case_id}")
     st.write(f"**Nombre:** {case_name}")
     st.write(f"**Estatus:** {case_status}")
-    st.write(f"**Cliente ID:** {case.get('client_id','')}")
+    st.write(f"**Cliente ID:** {client_id}")
     st.write(f"**Drive folder:** {drive_folder_id}")
 
-    # Bloqueo de edición
     is_locked = (case_status in ("PENDIENTE", "ENVIADO")) and (not authorized)
     if is_locked:
-        st.warning("🔒 Este trámite está PENDIENTE/ENVIADO. Para modificarlo activa el toggle y usa el código.")
+        st.warning("🔒 Trámite PENDIENTE/ENVIADO. Para modificar activa el toggle y usa el código.")
+
+    # ✅ Si no existe folder, permitir crearlo aquí mismo
+    if not drive_folder_id:
+        if st.button("📁 Crear carpeta en Drive ahora", key=f"mk_drive_{case_id}", disabled=is_locked):
+            try:
+                root_folder_id = st.secrets["drive"]["root_folder_id"]
+                folder_name = f"{case_id} - {case_name}".strip()
+                res = create_case_folder_via_script(
+                    root_folder_id=root_folder_id,
+                    case_id=case_id,
+                    folder_name=folder_name,
+                )
+                drive_folder_id = res.get("folder_id", "")
+                if not drive_folder_id:
+                    raise RuntimeError(f"No se recibió folder_id: {res}")
+                update_case_fields(case_id, {"drive_folder_id": drive_folder_id})
+                st.success("✅ Carpeta creada y vinculada al trámite.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error creando carpeta: {type(e).__name__}: {e}")
 
     st.divider()
 
@@ -299,16 +321,14 @@ with tab_manage:
     if items_df is None or items_df.empty:
         st.info("Aún no hay vehículos ni artículos en este trámite.")
     else:
-        cols = [c for c in ["case_seq","item_type","unique_key","brand","model","year","description","quantity","weight","value","created_at"] if c in items_df.columns]
+        cols = [c for c in ["case_seq","item_type","unique_key","brand","model","year","description","quantity","weight","value","parent_vin","created_at"] if c in items_df.columns]
         st.dataframe(items_df[cols], use_container_width=True)
 
     # ======================================================
-    # VEHÍCULO: VIN por dictado/pegar + CONFIRMAR + DECODIFICAR
+    # VEHÍCULO: VIN por dictado/pegar + confirmar + decode
     # ======================================================
     st.divider()
     st.subheader("Agregar vehículo (VIN por dictado o copiar/pegar)")
-
-    st.caption("1) Ingresa VIN  2) Confirma que está correcto  3) Consultar info del vehículo  4) Guardar")
 
     vin_method = st.radio(
         "Método VIN",
@@ -320,11 +340,10 @@ with tab_manage:
 
     vin_text = ""
     if vin_method == "⌨️ Copiar/Pegar":
-        vin_text = st.text_input("Pega VIN aquí", value="", key=f"vin_paste_{case_id}", disabled=is_locked)
+        vin_text = st.text_input("VIN", value="", key=f"vin_paste_{case_id}", disabled=is_locked)
     else:
-        vin_text = st.text_area("Dicta aquí (puede venir texto con VIN dentro)", height=70, key=f"vin_dict_{case_id}", disabled=is_locked)
+        vin_text = st.text_area("Dictado (puede venir texto con VIN dentro)", height=70, key=f"vin_dict_{case_id}", disabled=is_locked)
 
-    vin_found = ""
     vin_candidates = []
     if vin_text:
         up = re.sub(r"[^A-Z0-9]", "", vin_text.upper())
@@ -332,30 +351,31 @@ with tab_manage:
         vin_candidates = list(dict.fromkeys(vin_candidates))
 
     if vin_candidates:
-        vin_found = st.selectbox("VIN detectados en el texto", vin_candidates, key=f"vin_cands_txt_{case_id}", disabled=is_locked)
+        vin_norm = st.selectbox("VIN detectado por el texto", vin_candidates, key=f"vin_detected_{case_id}", disabled=is_locked)
+        vin_norm = normalize_vin(vin_norm)
+    else:
+        vin_norm = normalize_vin(vin_text)
 
-    vin_input = st.text_input("VIN final (editable)", value=vin_found, key=f"vin_final_{case_id}", disabled=is_locked)
-    vin_norm = normalize_vin(vin_input)
+    if vin_norm:
+        st.write(f"**VIN:** {vin_norm}")
 
     if vin_norm and len(vin_norm) == 17 and not is_valid_vin(vin_norm):
         st.warning("VIN inválido (contiene I/O/Q o caracteres no permitidos).")
 
-    confirm_vin = st.checkbox("✅ Confirmo que el VIN está correcto", value=False, key=f"vin_confirm_{case_id}", disabled=is_locked)
+    confirm_vin = st.checkbox("✅ Confirmo que el VIN es correcto", value=False, key=f"vin_confirm_{case_id}", disabled=is_locked)
 
-    # Estado decode en session_state
     dec_key = f"vin_decoded_{case_id}"
     st.session_state.setdefault(dec_key, {})
 
-    # Botón consultar info (solo si VIN confirmado)
     consult_disabled = is_locked or (not confirm_vin) or (not vin_norm) or (len(vin_norm) != 17) or (not is_valid_vin(vin_norm))
-    if st.button("Consultar información del vehículo (Decode)", key=f"vin_decode_btn_{case_id}", disabled=consult_disabled):
+    if st.button("Consultar información del vehículo", key=f"vin_decode_btn_{case_id}", disabled=consult_disabled):
         out = decode_vin(vin_norm) or {}
         if out.get("error"):
             st.error(out["error"])
             st.session_state[dec_key] = {}
         else:
             st.session_state[dec_key] = out
-            st.success("✅ Información consultada. Revisa/ajusta antes de guardar.")
+            st.success("✅ Info consultada. Revisa/ajusta antes de guardar.")
 
     decoded = st.session_state.get(dec_key, {}) or {}
 
@@ -367,26 +387,16 @@ with tab_manage:
     with c3:
         year = st.text_input("Año", value=str(decoded.get("year", "") or ""), key=f"veh_year_{case_id}", disabled=is_locked)
 
-    # Peso: solo si viene de NHTSA (no inventamos)
     weight_suggest = ""
     if (decoded.get("curb_weight") or "").strip():
         weight_suggest = str(decoded.get("curb_weight")).strip()
     elif (decoded.get("gvwr") or "").strip():
         weight_suggest = f"GVWR: {str(decoded.get('gvwr')).strip()}"
 
-    weight = st.text_input(
-        "Peso (solo si lo tienes / o si el decoder lo devuelve)",
-        value=weight_suggest,
-        key=f"veh_weight_{case_id}",
-        disabled=is_locked,
-    )
-    if weight_suggest:
-        st.caption("ℹ️ El peso mostrado proviene del decoder (NHTSA) si venía disponible. Puedes editarlo.")
-    else:
-        st.caption("ℹ️ No se encontró peso en el decoder. Déjalo vacío o ingrésalo manualmente (sin inventar).")
+    weight = st.text_input("Peso (opcional)", value=weight_suggest, key=f"veh_weight_{case_id}", disabled=is_locked)
 
     evidence = st.file_uploader(
-        "📎 Sube foto evidencia del VIN (opcional, NO OCR)",
+        "📎 Evidencia VIN (opcional: foto/pdf, no OCR)",
         type=["jpg","jpeg","png","pdf"],
         key=f"vin_evidence_{case_id}",
         disabled=is_locked,
@@ -406,7 +416,6 @@ with tab_manage:
             if not is_valid_vin(vin_norm):
                 raise ValueError("VIN inválido. Debe tener 17 caracteres y NO incluir I/O/Q.")
 
-            # Guardamos: quantity=1, value="0", description=""
             item_id = add_vehicle_item(
                 case_id=case_id,
                 vin=vin_norm,
@@ -420,20 +429,15 @@ with tab_manage:
                 source="vin_text",
             )
 
-            # Evidencia opcional
             if evidence is not None:
                 if not drive_folder_id:
-                    raise RuntimeError("Este trámite no tiene drive_folder_id. Revisa creación de carpeta.")
-
-                file_bytes = evidence.getvalue()
-                file_name = evidence.name
-                mime = evidence.type or "application/octet-stream"
+                    raise RuntimeError("Este trámite aún no tiene carpeta en Drive. Crea la carpeta primero.")
 
                 up = upload_file_to_case_folder_via_script(
                     case_folder_id=drive_folder_id,
-                    file_bytes=file_bytes,
-                    file_name=file_name,
-                    mime_type=mime,
+                    file_bytes=evidence.getvalue(),
+                    file_name=evidence.name,
+                    mime_type=evidence.type or "application/octet-stream",
                     subfolder="VIN_EVIDENCIA",
                 )
                 drive_file_id = up.get("file_id", "")
@@ -445,7 +449,7 @@ with tab_manage:
                     item_id=item_id,
                     doc_type="vin_evidence",
                     drive_file_id=drive_file_id,
-                    file_name=file_name,
+                    file_name=evidence.name,
                 )
 
             st.session_state[dec_key] = {}
@@ -461,11 +465,10 @@ with tab_manage:
     st.divider()
     st.subheader("Agregar artículo (dictado continuo)")
 
-    last_msg_key = f"art_last_msg_{case_id}"
-    if st.session_state.get(last_msg_key):
-        st.success(st.session_state[last_msg_key])
-
     st.caption("Ejemplo: tipo lavadora ref 440827 marca LG modelo X peso 95 lb estado usado cantidad 1 valor 120 parte_vehiculo no")
+
+    dictation = st.text_area("Dictado", height=80, key=f"art_dict_{case_id}", disabled=is_locked)
+    parsed = _parse_article_dictation(dictation)
 
     k_type = f"art_type_{case_id}"
     k_ref = f"art_ref_{case_id}"
@@ -476,20 +479,19 @@ with tab_manage:
     k_qty = f"art_qty_{case_id}"
     k_value = f"art_value_{case_id}"
     k_is_part = f"art_is_part_{case_id}"
-    k_parent_sel = f"art_parent_sel_{case_id}"
-    k_parent_txt = f"art_parent_txt_{case_id}"
     k_desc = f"art_desc_{case_id}"
+    k_last_msg = f"art_last_msg_{case_id}"
     k_last_fpr = f"art_last_fpr_{case_id}"
 
     for k, dv in [
         (k_type, ""), (k_ref, ""), (k_brand, ""), (k_model, ""),
         (k_weight, ""), (k_cond, ""), (k_qty, 1), (k_value, ""),
-        (k_is_part, False), (k_parent_txt, ""), (k_desc, ""), (k_last_fpr, "")
+        (k_is_part, False), (k_desc, ""), (k_last_msg, ""), (k_last_fpr, "")
     ]:
         st.session_state.setdefault(k, dv)
 
-    dictation = st.text_area("Dictado", height=80, key=f"art_dict_{case_id}", disabled=is_locked)
-    parsed = _parse_article_dictation(dictation)
+    if st.session_state.get(k_last_msg):
+        st.success(st.session_state[k_last_msg])
 
     if st.button("Aplicar dictado", key=f"art_apply_{case_id}", disabled=is_locked):
         st.session_state[k_type] = parsed.get("type", "") or ""
@@ -505,10 +507,6 @@ with tab_manage:
             st.session_state[k_qty] = 1
         st.session_state[k_is_part] = bool(parsed.get("is_vehicle_part", False))
 
-        pv = normalize_vin(parsed.get("parent_vin", "") or "")
-        if pv:
-            st.session_state[k_parent_txt] = pv
-
         st.session_state[k_desc] = _build_article_description(
             st.session_state[k_type],
             st.session_state[k_ref],
@@ -520,7 +518,7 @@ with tab_manage:
             st.session_state[k_value],
         )
 
-        st.success("✅ Aplicado. Estado y descripción se llenaron automáticamente.")
+        st.success("✅ Aplicado. Estado y descripción autocompletados.")
 
     a1, a2, a3 = st.columns(3)
     with a1:
@@ -536,7 +534,7 @@ with tab_manage:
     with b2:
         art_weight = st.text_input("Peso (lb/kg)", key=k_weight, disabled=is_locked)
     with b3:
-        art_condition = st.text_input("Estado (auto por dictado)", key=k_cond, disabled=is_locked)
+        art_condition = st.text_input("Estado (auto)", key=k_cond, disabled=is_locked)
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -552,13 +550,10 @@ with tab_manage:
         if items_df is not None and not items_df.empty and "item_type" in items_df.columns and "unique_key" in items_df.columns:
             vins = items_df[items_df["item_type"] == "vehicle"]["unique_key"].tolist()
             vins = [v for v in vins if v]
-
         if vins:
-            parent_vin = st.selectbox("VIN del vehículo", vins, key=k_parent_sel, disabled=is_locked)
+            parent_vin = st.selectbox("VIN del vehículo", vins, key=f"art_parent_{case_id}", disabled=is_locked)
         else:
-            parent_vin = st.text_input("VIN (no hay vehículos aún)", key=k_parent_txt, disabled=is_locked)
-    else:
-        parent_vin = ""
+            parent_vin = st.text_input("VIN (no hay vehículos aún)", value="", key=f"art_parent_txt_{case_id}", disabled=is_locked)
 
     if st.button("Regenerar descripción", key=f"art_regen_{case_id}", disabled=is_locked):
         st.session_state[k_desc] = _build_article_description(
@@ -579,24 +574,16 @@ with tab_manage:
         try:
             desc_final = (art_desc or "").strip()
             if not desc_final:
-                raise ValueError("Descripción vacía. Usa 'Regenerar descripción' o aplica dictado.")
+                raise ValueError("Descripción vacía. Aplica dictado o regenera descripción.")
 
             pv_norm = normalize_vin(parent_vin) if is_part else ""
-            if pv_norm and (len(pv_norm) != 17 or not is_valid_vin(pv_norm)):
-                raise ValueError("VIN inválido para parte de vehículo.")
 
+            # anti doble click (session)
             fpr = "|".join([
-                case_id,
-                str(art_type).strip().lower(),
-                str(art_ref).strip().lower(),
-                str(art_brand).strip().lower(),
-                str(art_model).strip().lower(),
-                str(art_weight).strip().lower(),
-                str(art_condition).strip().lower(),
-                str(int(art_qty or 1)),
-                pv_norm,
-                desc_final.lower(),
-                str(art_value).strip().lower(),
+                case_id, art_type.strip().lower(), art_ref.strip().lower(),
+                art_brand.strip().lower(), art_model.strip().lower(),
+                art_weight.strip().lower(), art_condition.strip().lower(),
+                str(int(art_qty or 1)), pv_norm, desc_final.lower(), art_value.strip().lower()
             ])
             if st.session_state.get(k_last_fpr, "") == fpr:
                 st.warning("Este artículo ya se guardó (mismo envío). No se guardó de nuevo.")
@@ -612,24 +599,25 @@ with tab_manage:
                 value=art_value,
                 parent_vin=pv_norm,
                 source="voice" if dictation.strip() else "manual",
+                fingerprint=fpr,
             )
 
             st.session_state[k_last_fpr] = fpr
-            st.session_state[last_msg_key] = "✅ Artículo guardado correctamente."
-            st.toast("Artículo agregado al trámite", icon="✅")
+            st.session_state[k_last_msg] = "✅ Artículo guardado correctamente."
+            st.toast("Artículo agregado", icon="✅")
             st.rerun()
 
         except Exception as e:
             st.error(f"Error guardando artículo: {type(e).__name__}: {e}")
 
     # ======================================================
-    # DOCUMENTOS (dentro de Gestionar trámite)
+    # DOCUMENTOS (desde aquí mismo)
     # ======================================================
     st.divider()
     st.subheader("📎 Documentos del trámite (cliente / vehículos / artículos)")
 
     if not drive_folder_id:
-        st.warning("Este trámite aún no tiene carpeta en Drive (drive_folder_id vacío). Revisa la creación del trámite.")
+        st.warning("Este trámite aún NO tiene carpeta en Drive. Usa el botón 'Crear carpeta en Drive ahora' arriba.")
     else:
         docs_df = list_documents(case_id).fillna("")
         if docs_df.empty:
@@ -637,7 +625,6 @@ with tab_manage:
         else:
             st.dataframe(docs_df, use_container_width=True)
 
-        # Para asociar al vehículo o artículo si quieres
         attach_options = [("Trámite (general / cliente)", "")]
         if items_df is not None and not items_df.empty:
             for _, r in items_df.iterrows():
@@ -666,15 +653,11 @@ with tab_manage:
 
         if st.button("Subir documento a Drive", type="primary", key=f"doc_upload_btn_{case_id}", disabled=is_locked or (upload is None)):
             try:
-                file_bytes = upload.getvalue()
-                file_name = upload.name
-                mime = upload.type or "application/octet-stream"
-
                 up = upload_file_to_case_folder_via_script(
                     case_folder_id=drive_folder_id,
-                    file_bytes=file_bytes,
-                    file_name=file_name,
-                    mime_type=mime,
+                    file_bytes=upload.getvalue(),
+                    file_name=upload.name,
+                    mime_type=upload.type or "application/octet-stream",
                     subfolder="DOCUMENTOS",
                 )
                 drive_file_id = up.get("file_id", "")
@@ -686,7 +669,7 @@ with tab_manage:
                     item_id=attach_item_id,
                     doc_type=doc_type,
                     drive_file_id=drive_file_id,
-                    file_name=file_name,
+                    file_name=upload.name,
                 )
 
                 st.success("✅ Documento subido y registrado.")
@@ -704,17 +687,18 @@ with tab_list:
     if df.empty:
         st.info("No hay trámites registrados.")
     else:
-        if "case_name" not in df.columns:
-            df["case_name"] = ""
-        if "status" not in df.columns:
-            df["status"] = "BORRADOR"
+        for col in ["case_name","status"]:
+            if col not in df.columns:
+                df[col] = ""
 
         df["status"] = df["status"].astype(str).str.upper().str.strip()
+        df.loc[df["status"] == "", "status"] = "BORRADOR"
+
         status_filter = st.selectbox("Filtrar estatus", ["TODOS", "BORRADOR", "PENDIENTE", "ENVIADO"], index=0)
 
         view = df.copy()
         if status_filter != "TODOS":
             view = view[view["status"] == status_filter]
 
-        cols = [c for c in ["case_id", "case_name", "status", "origin", "destination", "created_at", "updated_at"] if c in view.columns]
+        cols = [c for c in ["case_id","case_name","status","origin","destination","created_at","updated_at"] if c in view.columns]
         st.dataframe(view[cols], use_container_width=True)
