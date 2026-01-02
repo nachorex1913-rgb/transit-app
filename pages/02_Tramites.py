@@ -193,14 +193,17 @@ if "vin_res" not in st.session_state:
 if extract_btn and vin_image is not None:
     res = extract_vin_from_image(vin_image.getvalue())
     st.session_state["vin_res"] = res
+    if res.get("error"):
+    st.error(res["error"])
 
 res = st.session_state.get("vin_res", {}) or {}
 cands = res.get("candidates", []) or []
 conf = float(res.get("confidence", 0.0) or 0.0)
 
-with st.expander("🧪 Debug OCR (texto leído)"):
-    st.text(res.get("raw_text", "") or "")
-    st.write("Candidatos:", cands)
+with st.expander("🧪 Debug OCR"):
+    st.write("found_keywords:", res.get("found_keywords"))
+    st.text(res.get("raw_text",""))
+    st.write("candidates:", res.get("candidates", []))
 
 if cands:
     vin_detected = st.selectbox(
