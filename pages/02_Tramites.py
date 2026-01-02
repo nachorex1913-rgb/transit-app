@@ -237,23 +237,29 @@ decode_disabled = (not vin_input_norm) or (len(vin_input_norm) != 17)
 decode_btn = st.button(
     "Decodificar VIN",
     key=f"decode_btn_{case_id}",
-    disabled=decode_disabled,
+    disabled=(not vin_input_norm or len(vin_input_norm) != 17),
 )
 
-# ✅ SIEMPRE definimos decoded (para evitar NameError)
+# SIEMPRE existe decoded
 decoded = st.session_state.get(vin_decoded_key, {}) or {}
 
 if decode_btn:
     out = decode_vin(vin_input_norm) or {}
+
+    # ✅ Si hay error, NO success
     if out.get("error"):
-        st.error(out["error"])
+        st.warning(out["error"])
         st.session_state[vin_decoded_key] = {}
         decoded = {}
-        st.write("VIN decode output:", out)
     else:
         st.session_state[vin_decoded_key] = out
         decoded = out
-        st.success("VIN decodificado correctamente.")
+
+        # ✅ success SOLO si vino algo útil
+        if (decoded.get("brand") or "").strip() or (decoded.get("model") or "").strip() or (decoded.get("year") or "").strip():
+            st.success("VIN decodificado correctamente.")
+        else:
+            st.warning("Se consultó el decoder pero no devolvió datos útiles. Ingresa manual.")
 
 st.write(f"**Confianza OCR:** {conf:.2f}")
 if vin_input_norm and len(vin_input_norm) == 17 and not is_valid_vin(vin_input_norm):
