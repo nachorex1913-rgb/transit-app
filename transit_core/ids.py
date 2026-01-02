@@ -1,63 +1,67 @@
 # transit_core/ids.py
 from __future__ import annotations
-from datetime import datetime
+
 import re
+from typing import List
 
-CASE_RE = re.compile(r"^TR-(\d{4})-(\d{6})$")
 
-def normalize_name_for_folder(name: str) -> str:
-    # limpio para nombre de carpeta Drive
-    safe = re.sub(r"[^a-zA-Z0-9\s_-]", "", name or "").strip()
-    safe = re.sub(r"\s+", "-", safe)
-    return safe[:60] if safe else "CLIENTE"
-
-def next_case_id(existing_case_ids: list[str], year: int | None = None) -> str:
-    """Devuelve siguiente TR-YYYY-000001 basado en los existentes en el Sheet."""
-    y = year or datetime.now().year
-    max_n = 0
-    for cid in existing_case_ids:
-        m = CASE_RE.match(str(cid).strip())
-        if not m:
-            continue
-        yy = int(m.group(1))
-        nn = int(m.group(2))
-        if yy == y and nn > max_n:
-            max_n = nn
-    return f"TR-{y}-{max_n+1:06d}"
-
-def next_article_seq(existing_unique_keys: list[str], case_id: str) -> str:
+def next_case_id(existing_case_ids: List[str], year: int) -> str:
     """
-    Genera consecutivo por trámite para artículos:
-    A-<case_id>-0001
+    TR-YYYY-000001
+    contador anual
     """
-    prefix = f"A-{case_id}-"
-    max_n = 0
-    for k in existing_unique_keys:
+    mx = 0
+    pat = re.compile(rf"^TR-{year}-\d{{6}}$")
+    for cid in existing_case_ids or []:
+        cid = str(cid).strip()
+        if pat.match(cid):
+            try:
+                mx = max(mx, int(cid.split("-")[-1]))
+            except Exception:
+                pass
+    return f"TR-{year}-{mx+1:06d}"
+
+
+def next_item_id(existing_item_ids: List[str]) -> str:
+    """
+    ITEM-000001 global
+    """
+    mx = 0
+    pat = re.compile(r"^IT-\d{6}$")
+    for x in existing_item_ids or []:
+        s = str(x).strip()
+        if pat.match(s):
+            try:
+                mx = max(mx, int(s.split("-")[-1]))
+            except Exception:
+                pass
+    return f"IT-{mx+1:06d}"
+
+
+def next_doc_id(existing_doc_ids: List[str]) -> str:
+    mx = 0
+    pat = re.compile(r"^DC-\d{6}$")
+    for x in existing_doc_ids or []:
+        s = str(x).strip()
+        if pat.match(s):
+            try:
+                mx = max(mx, int(s.split("-")[-1]))
+            except Exception:
+                pass
+    return f"DC-{mx+1:06d}"
+
+
+def next_article_seq(existing_keys_case: List[str], case_id: str) -> str:
+    """
+    A-<CASE_ID>-0001  (por trámite)
+    """
+    mx = 0
+    pat = re.compile(rf"^A-{re.escape(case_id)}-\d{{4}}$")
+    for k in existing_keys_case or []:
         s = str(k).strip()
-        if not s.startswith(prefix):
-            continue
-        tail = s.replace(prefix, "")
-        if tail.isdigit():
-            max_n = max(max_n, int(tail))
-    return f"{prefix}{max_n+1:04d}"
-
-def next_item_id(existing_item_ids: list[str]) -> str:
-    """
-    Item IDs globales:
-    IT-0000001
-    """
-    max_n = 0
-    for iid in existing_item_ids:
-        s = str(iid).strip()
-        if s.startswith("IT-") and s[3:].isdigit():
-            max_n = max(max_n, int(s[3:]))
-    return f"IT-{max_n+1:07d}"
-
-def next_doc_id(existing_doc_ids: list[str]) -> str:
-    max_n = 0
-    for did in existing_doc_ids:
-        s = str(did).strip()
-        if s.startswith("DOC-") and s[4:].isdigit():
-            max_n = max(max_n, int(s[4:]))
-    return f"DOC-{max_n+1:07d}"
-
+        if pat.match(s):
+            try:
+                mx = max(mx, int(s.split("-")[-1]))
+            except Exception:
+                pass
+    return f"A-{case_id}-{mx+1:04d}"
