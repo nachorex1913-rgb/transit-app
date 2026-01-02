@@ -1,57 +1,86 @@
 # transit_core/drive_bridge.py
+from __future__ import annotations
+
+from typing import Dict, Any, Optional
 import base64
 import requests
 import streamlit as st
 
 
-def _cfg() -> tuple[str, str]:
-    url = st.secrets["apps_script"]["upload_url"]
-    token = st.secrets["apps_script"]["token"]
-    if not url or not token:
-        raise RuntimeError("Faltan secrets: apps_script.upload_url o apps_script.token")
-    return url, token
+DRIVE_BRIDGE_VERSION = "DRIVE_BRIDGE_APPS_SCRIPT_v2_2026-01-02"
 
 
-def _post(payload: dict, timeout: int = 90) -> dict:
-    url, token = _cfg()
-    payload = {**payload, "token": token}
-
-    r = requests.post(url, json=payload, timeout=timeout)
-    r.raise_for_status()
-    data = r.json()
-
-    if not isinstance(data, dict):
-        raise RuntimeError("Apps Script no devolvió JSON válido")
-
-    if not data.get("ok"):
-        raise RuntimeError(data.get("error", "Apps Script call failed"))
-
-    return data
+def _script_url() -> str:
+    url = st.secrets.get("drive", {}).get("script_url", "")
+    if not url:
+        raise RuntimeError("Falta secrets: drive.script_url")
+    return url
 
 
-def upload_to_drive_via_script(folder_id: str, file_name: str, mime_type: str, file_bytes: bytes) -> str:
-    data = _post({
-        "action": "upload",
-        "folder_id": folder_id,
-        "file_name": file_name,
-        "mime_type": mime_type or "application/octet-stream",
-        "file_b64": base64.b64encode(file_bytes).decode("utf-8"),
-    })
-    return data["file_id"]
+def _script_token() -> str:
+    tok = st.secrets.get("drive", {}).get("script_token", "")
+    if not tok:
+        raise RuntimeError("Falta secrets: drive.script_token")
+    return tok
 
 
-def create_case_folder_via_script(root_folder_id: str, case_id: str, folder_name: str | None = None) -> dict:
+def create_case_folder_via_script(root_folder_id: str, case_id: str, folder_name: str) -> Dict[str, Any]:
+    """
+    Crea carpeta del caso en Drive usando Apps Script Web App.
+    """
     payload = {
+        "token": _script_token(),
         "action": "create_case_folder",
         "root_folder_id": root_folder_id,
         "case_id": case_id,
+        "folder_name": folder_name,
+        "version": DRIVE_BRIDGE_VERSION,
     }
-    if folder_name:
-        payload["folder_name"] = folder_name
+    r = requests.post(_script_url(), json=payload, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Drive Script error: {data}")
+    return data
 
-    data = _post(payload, timeout=90)
-    return {
-        "folder_id": data["folder_id"],
-        "folder_url": data.get("folder_url"),
-        "subfolders": data.get("subfolders", {}),
+
+def upload_file_to_case_folder_via_script(
+    case_folder_id: str,
+    file_bytes: bytes,
+    file_name: str,
+    mime_type: str = "application/octet-stream",
+    subfolder: str = "",
+) -> Dict[str, Any]:
+    """
+    Sube archivo a la carpeta del caso (Drive) usando Apps Script Web App.
+
+    Devuelve:
+      {
+        ok: True,
+        file_id: "...",
+        file_name: "...",
+        webViewLink: "...",
+        ...
+      }
+    """
+    if not case_folder_id:
+        raise ValueError("case_folder_id vacío. No se puede subir archivo.")
+
+    b64 = base64.b64encode(file_bytes).decode("utf-8")
+
+    payload = {
+        "token": _script_token(),
+        "action": "upload_file",
+        "case_folder_id": case_folder_id,
+        "file_name": file_name,
+        "mime_type": mime_type,
+        "subfolder": subfolder or "",
+        "file_b64": b64,
+        "version": DRIVE_BRIDGE_VERSION,
     }
+    r = requests.post(_script_url(), json=payload, timeout=60)
+    r.raise_for_status()
+    data = r.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Drive Script upload error: {data}")
+    return data
