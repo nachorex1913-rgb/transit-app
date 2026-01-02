@@ -113,14 +113,14 @@ if st.button("Crear trámite", type="primary", key="create_case_btn"):
         cases_df = list_cases().fillna("")
         existing_ids = cases_df["case_id"].tolist() if "case_id" in cases_df.columns else []
         year = datetime.now().year
-        case_id = next_case_id(existing_ids, year=year)
+        case_id_new = next_case_id(existing_ids, year=year)
 
         root_folder_id = st.secrets["drive"]["root_folder_id"]
-        folder_name = f"{case_id} - {client_name}".strip()
+        folder_name = f"{case_id_new} - {client_name}".strip()
 
         res = create_case_folder_via_script(
             root_folder_id=root_folder_id,
-            case_id=case_id,
+            case_id=case_id_new,
             folder_name=folder_name,
         )
         drive_folder_id = res["folder_id"]
@@ -182,47 +182,44 @@ st.subheader("Agregar vehículo (VIN por foto)")
 vin_image = st.file_uploader(
     "Sube foto del VIN (desde cámara)",
     type=["jpg", "jpeg", "png"],
-    key=f"vin_uploader_{case_id}"
+    key=f"vin_uploader_{case_id}",
 )
 
 extract_btn = st.button("Extraer VIN de la foto", key=f"extract_vin_btn_{case_id}")
 
-# ✅ session state aislado por trámite
+# state aislado por trámite
 vin_res_key = f"vin_res_{case_id}"
+vin_decoded_key = f"vin_decoded_{case_id}"
+
 if vin_res_key not in st.session_state:
-    st.session_state[vin_res_key] = {
-        "vin": "",
-        "confidence": 0.0,
-        "raw_text": "",
-        "candidates": [],
-        "found_keywords": False,
-        "error": ""
-    }
+    st.session_state[vin_res_key] = {"vin": "", "confidence": 0.0, "raw_text": "", "candidates": [], "error": ""}
 
-if extract_btn and vin_image is not None:
-    res = extract_vin_from_image(vin_image.getvalue())
-    st.session_state[vin_res_key] = res
+if vin_decoded_key not in st.session_state:
+    st.session_state[vin_decoded_key] = {}
 
-    if res.get("error"):
-        st.error(res["error"])
+if extract_btn:
+    if vin_image is None:
+        st.warning("Sube una imagen primero.")
+    else:
+        res = extract_vin_from_image(vin_image.getvalue())
+        st.session_state[vin_res_key] = res
+        if res.get("error"):
+            st.error(res["error"])
 
 res = st.session_state.get(vin_res_key, {}) or {}
 cands = res.get("candidates", []) or []
 conf = float(res.get("confidence", 0.0) or 0.0)
 
 with st.expander("🧪 Debug OCR"):
-    st.write("found_keywords:", res.get("found_keywords"))
-    st.text(res.get("raw_text", "") or "")
+    st.write("confidence:", conf)
     st.write("candidates:", cands)
-
-if not res.get("found_keywords", False):
-    st.warning("No se detectaron palabras clave VIN / Vehicle ID Number. Toma la foto más cerca del VIN y su etiqueta.")
+    st.text(res.get("raw_text", "") or "")
 
 if cands:
     vin_detected = st.selectbox(
         "VIN detectados (elige el correcto)",
         cands,
-        key=f"vin_candidates_{case_id}"
+        key=f"vin_candidates_{case_id}",
     )
 else:
     vin_detected = res.get("vin", "") or ""
@@ -230,31 +227,35 @@ else:
 vin_input = st.text_input(
     "VIN detectado (puedes corregirlo)",
     value=vin_detected,
-    key=f"vin_input_{case_id}"
+    key=f"vin_input_{case_id}",
 )
 
 vin_input_norm = normalize_vin(vin_input)
 
+decode_disabled = (not vin_input_norm) or (len(vin_input_norm) != 17)
 decode_btn = st.button(
     "Decodificar VIN",
     key=f"decode_btn_{case_id}",
-    disabled=(not vin_input_norm or not is_valid_vin(vin_input_norm))
+    disabled=decode_disabled,
 )
 
-vin_decoded_key = f"vin_decoded_{case_id}"
-if vin_decoded_key not in st.session_state:
-    st.session_state[vin_decoded_key] = {}
+# ✅ SIEMPRE definimos decoded (para evitar NameError)
+decoded = st.session_state.get(vin_decoded_key, {}) or {}
 
 if decode_btn:
     out = decode_vin(vin_input_norm) or {}
     if out.get("error"):
         st.error(out["error"])
         st.session_state[vin_decoded_key] = {}
+        decoded = {}
     else:
         st.session_state[vin_decoded_key] = out
+        decoded = out
         st.success("VIN decodificado correctamente.")
 
 st.write(f"**Confianza OCR:** {conf:.2f}")
+if vin_input_norm and len(vin_input_norm) == 17 and not is_valid_vin(vin_input_norm):
+    st.warning("VIN inválido (contiene I/O/Q o caracteres no permitidos). Verifica antes de guardar.")
 
 veh_c1, veh_c2, veh_c3 = st.columns(3)
 with veh_c1:
@@ -277,13 +278,15 @@ description = st.text_area("Descripción (opcional)", value="", height=80, key=f
 confirm_vehicle = st.checkbox(
     "✅ Confirmo que el VIN y la información son correctos antes de guardar.",
     value=False,
-    key=f"veh_confirm_{case_id}"
+    key=f"veh_confirm_{case_id}",
 )
 
 if st.button("Guardar vehículo", type="primary", disabled=not confirm_vehicle, key=f"save_vehicle_{case_id}"):
     try:
+        if len(vin_input_norm) != 17:
+            raise ValueError("VIN debe tener 17 caracteres.")
         if not is_valid_vin(vin_input_norm):
-            raise ValueError("VIN inválido. Debe tener 17 caracteres y no incluir I/O/Q.")
+            raise ValueError("VIN inválido. Debe tener 17 caracteres y NO incluir I/O/Q.")
 
         add_vehicle_item(
             case_id=case_id,
@@ -300,7 +303,7 @@ if st.button("Guardar vehículo", type="primary", disabled=not confirm_vehicle, 
 
         st.success("Vehículo guardado.")
         st.session_state[vin_decoded_key] = {}
-        st.session_state[vin_res_key] = {"vin": "", "confidence": 0.0, "raw_text": "", "candidates": [], "found_keywords": False, "error": ""}
+        st.session_state[vin_res_key] = {"vin": "", "confidence": 0.0, "raw_text": "", "candidates": [], "error": ""}
         st.rerun()
 
     except Exception as e:
@@ -355,7 +358,7 @@ art_description = st.text_area("Descripción", value=art_desc_default, height=80
 confirm_article = st.checkbox(
     "✅ Confirmo que la información del artículo es correcta antes de guardar.",
     value=False,
-    key=f"art_confirm_{case_id}"
+    key=f"art_confirm_{case_id}",
 )
 
 if st.button("Guardar artículo", type="primary", disabled=not confirm_article, key=f"save_article_{case_id}"):
@@ -364,7 +367,7 @@ if st.button("Guardar artículo", type="primary", disabled=not confirm_article, 
 
         if is_part:
             pv = normalize_vin(parent_vin)
-            if pv and is_valid_vin(pv):
+            if pv and len(pv) == 17 and is_valid_vin(pv):
                 desc = f"[PARTE_DE_VEHICULO:{pv}] {desc}".strip()
             else:
                 desc = f"[PARTE_DE_VEHICULO] {desc}".strip()
