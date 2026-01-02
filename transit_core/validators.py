@@ -1,6 +1,5 @@
 # transit_core/validators.py
 from __future__ import annotations
-
 import re
 
 # -----------------------------
@@ -9,27 +8,20 @@ import re
 VIN_BASIC_RE = re.compile(r"^[A-HJ-NPR-Z0-9]{17}$")  # sin I/O/Q
 
 def normalize_vin(vin: str) -> str:
-    """
-    Normaliza VIN: uppercase, elimina espacios y caracteres no alfanuméricos.
-    """
+    """Uppercase + elimina todo lo que no sea A-Z/0-9."""
     if not vin:
         return ""
     v = vin.strip().upper()
     v = re.sub(r"[^A-Z0-9]", "", v)
     return v
 
-
 def is_valid_vin(vin: str) -> bool:
-    """
-    Validación básica: 17 chars y excluye I/O/Q.
-    (Esto es lo que tu gsheets_db.py y add_vehicle_item ya esperan)
-    """
+    """Validación básica: 17 chars y excluye I/O/Q."""
     v = normalize_vin(vin)
     return bool(VIN_BASIC_RE.match(v))
 
-
 # -----------------------------
-# Validación estricta ISO 3779 (check digit) - NUEVO
+# ISO 3779 check digit (STRICT)
 # -----------------------------
 _VIN_TRANS = {
     **{str(i): i for i in range(10)},
@@ -39,31 +31,22 @@ _VIN_TRANS = {
 }
 _VIN_WEIGHTS = [8, 7, 6, 5, 4, 3, 2, 10, 0, 9, 8, 7, 6, 5, 4, 3, 2]
 
-
 def vin_check_digit(vin: str) -> str:
-    """
-    Calcula el check digit ISO 3779 (posición 9).
-    Retorna '0'-'9' o 'X'. Si no es calculable retorna ''.
-    """
+    """Calcula check digit ISO 3779 (posición 9). Retorna '0'-'9' o 'X'."""
     v = normalize_vin(vin)
     if len(v) != 17:
         return ""
-
     total = 0
     for i, ch in enumerate(v):
         val = _VIN_TRANS.get(ch)
         if val is None:
             return ""
         total += val * _VIN_WEIGHTS[i]
-
     rem = total % 11
     return "X" if rem == 10 else str(rem)
 
-
 def is_valid_vin_strict(vin: str) -> bool:
-    """
-    Valida VIN con formato básico + check digit ISO 3779.
-    """
+    """Formato básico + check digit."""
     v = normalize_vin(vin)
     if not VIN_BASIC_RE.match(v):
         return False
