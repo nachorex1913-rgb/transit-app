@@ -1,4 +1,3 @@
-# transit_core/vin_decode.py
 from __future__ import annotations
 
 from typing import Dict, Any
@@ -6,7 +5,7 @@ import requests
 
 from .validators import normalize_vin, is_valid_vin
 
-VIN_DECODE_VERSION = "VIN_DECODE_GENERIC_v2_2026-01-02"
+VIN_DECODE_VERSION = "VIN_DECODE_GENERIC_v3_2026-01-02"
 
 _WMI_BRAND = {
     "JHM": "HONDA", "1HG": "HONDA", "2HG": "HONDA", "JH4": "ACURA",
@@ -32,42 +31,60 @@ _YEAR_2010_2039 = {
     "8": 2038, "9": 2039,
 }
 
+
 def _brand_from_wmi(vin: str) -> str:
     return _WMI_BRAND.get(vin[:3], "")
 
+
 def _year_candidates(vin: str) -> list[int]:
-    code = vin[9]
+    code = vin[9]  # posición 10
     y1 = _YEAR_1980_2009.get(code)
     y2 = _YEAR_2010_2039.get(code)
-    out = []
+    out: list[int] = []
     if y1 is not None:
         out.append(y1)
     if y2 is not None and y2 != y1:
         out.append(y2)
     return out
 
+
+def _as_clean_str(v: Any) -> str:
+    """
+    Convierte cualquier valor a string limpio y seguro.
+    Evita reventar con .strip() en int/float/None.
+    """
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v.strip()
+    return str(v).strip()
+
+
 def _first_nonempty(row: dict, keys: list[str]) -> str:
     for k in keys:
-        v = (row.get(k) or "").strip()
+        v = _as_clean_str(row.get(k))
         if v:
             return v
     return ""
+
 
 def _decode_nhtsa(vin: str) -> Dict[str, Any]:
     url = f"https://vpic.nhtsa.dot.gov/api/vehicles/decodevinvaluesextended/{vin}?format=json"
     r = requests.get(url, timeout=15)
     r.raise_for_status()
+
     payload = r.json()
     results = payload.get("Results") or []
     row = results[0] if results else {}
 
-    make = (row.get("Make") or "").strip()
-    model = (row.get("Model") or "").strip()
-    year = (row.get("ModelYear") or "").strip()
+    make = _as_clean_str(row.get("Make"))
+    model = _as_clean_str(row.get("Model"))
+    year = _as_clean_str(row.get("ModelYear"))
 
-    err_text = (row.get("ErrorText") or "").strip()
-    err_code = (row.get("ErrorCode") or "").strip()
+    err_text = _as_clean_str(row.get("ErrorText"))
+    err_code = _as_clean_str(row.get("ErrorCode"))
 
+    # Si NO trae nada útil, tratamos como "sin data"
     if not (make or model or year):
         return {"error": "NHTSA_NO_DATA", "raw_error_text": err_text, "raw_error_code": err_code}
 
@@ -79,17 +96,23 @@ def _decode_nhtsa(vin: str) -> Dict[str, Any]:
         "brand": make,
         "model": model,
         "year": year,
-        "trim": (row.get("Trim") or row.get("Series") or "").strip(),
-        "engine": (row.get("EngineModel") or row.get("EngineConfiguration") or "").strip(),
-        "vehicle_type": (row.get("VehicleType") or "").strip(),
-        "body_class": (row.get("BodyClass") or "").strip(),
-        "plant_country": (row.get("PlantCountry") or "").strip(),
-        "curb_weight": curb_weight,  # puede venir vacío
-        "gvwr": gvwr,                # puede venir vacío
+        "trim": _first_nonempty(row, ["Trim", "Series"]),
+        "engine": _first_nonempty(row, ["EngineModel", "EngineConfiguration"]),
+        "vehicle_type": _as_clean_str(row.get("VehicleType")),
+        "body_class": _as_clean_str(row.get("BodyClass")),
+        "plant_country": _as_clean_str(row.get("PlantCountry")),
+        "curb_weight": curb_weight,
+        "gvwr": gvwr,
         "source": "nhtsa",
     }
 
+
 def decode_vin(vin: str) -> Dict[str, Any]:
+    """
+    Pipeline:
+    1) NHTSA vPIC -> si trae make/model/year retorna.
+    2) Fallback offline -> marca por WMI + año por pos 10 (modelo vacío)
+    """
     v = normalize_vin(vin)
 
     if not v:
@@ -102,17 +125,21 @@ def decode_vin(vin: str) -> Dict[str, Any]:
     nhtsa_status = ""
     nhtsa_text = ""
     nhtsa_code = ""
+
     try:
         out = _decode_nhtsa(v)
         if not out.get("error"):
             out["version"] = VIN_DECODE_VERSION
             return out
+
         nhtsa_status = out.get("error", "")
         nhtsa_text = out.get("raw_error_text", "")
         nhtsa_code = out.get("raw_error_code", "")
+
     except Exception as e:
         nhtsa_status = f"NHTSA_FAIL: {type(e).__name__}: {e}"
 
+    # OFFLINE fallback
     brand = _brand_from_wmi(v)
     years = _year_candidates(v)
 
