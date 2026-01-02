@@ -7,7 +7,6 @@ from transit_core.gsheets_db import (
     list_cases,
     get_case,
     create_case,
-    update_case_fields,
     list_items,
     add_vehicle_item,
     add_article_item,
@@ -15,33 +14,14 @@ from transit_core.gsheets_db import (
 from transit_core.drive_bridge import create_case_folder_via_script
 from transit_core.ids import next_case_id
 from transit_core.validators import normalize_vin, is_valid_vin
-
-# ✅ IMPORTS (ajusta si tus módulos tienen otros nombres)
-# Si todavía no tienes estas funciones con este nombre, deja el fallback de abajo.
-try:
-    from transit_core.vin_ocr import extract_vin_from_image
-except Exception:
-    extract_vin_from_image = None
-
-try:
-    from transit_core.vin_decode import decode_vin
-except Exception:
-    decode_vin = None
-
+from transit_core.vin_ocr import extract_vin_from_image
+from transit_core.vin_decode import decode_vin
 
 st.set_page_config(page_title="Trámites", layout="wide")
 st.title("Trámites")
 
 
-def _now_iso_utc() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
-
-
 def _parse_article_dictation(text: str) -> dict:
-    """
-    Dictado esperado (flexible):
-      ref: 8891-AX | marca: Milwaukee | modelo: M18 | peso: 3.5 lb | estado: usado | cantidad: 2 | parte_vehiculo: si | vin: 1HG...
-    """
     t = (text or "").strip()
     data = {
         "ref": "",
@@ -58,10 +38,7 @@ def _parse_article_dictation(text: str) -> dict:
     if not t:
         return data
 
-    # Normaliza separadores
     parts = [p.strip() for p in re.split(r"\||\n|;", t) if p.strip()]
-
-    # Si el usuario solo dicta una descripción libre:
     if len(parts) == 1 and ":" not in parts[0]:
         data["description"] = parts[0]
         return data
@@ -97,7 +74,6 @@ def _parse_article_dictation(text: str) -> dict:
         elif k in ("valor", "value"):
             data["value"] = v
 
-    # Si no dictó description, construye una con ref/marca/modelo/estado
     if not data["description"]:
         desc = " | ".join([x for x in [data["ref"], data["brand"], data["model"], data["condition"]] if x])
         data["description"] = desc.strip()
@@ -115,25 +91,24 @@ if clients_df.empty:
     st.warning("No hay clientes. Crea uno primero.")
     st.stop()
 
+clients_df["label"] = clients_df["client_id"].astype(str) + " — " + clients_df["name"].astype(str)
+
 c1, c2, c3 = st.columns([2, 2, 3])
 
 with c1:
-    clients_df["label"] = clients_df["client_id"].astype(str) + " — " + clients_df["name"].astype(str)
-    selected_label = st.selectbox("Cliente", clients_df["label"].tolist())
+    selected_label = st.selectbox("Cliente", clients_df["label"].tolist(), key="create_case_client")
     row = clients_df.loc[clients_df["label"] == selected_label].iloc[0]
     client_id = str(row["client_id"])
     client_name = str(row["name"]).strip()
 
 with c2:
-    origin = st.text_input("Origen", value="USA")
-    destination = st.text_input("Destino", value="Guatemala")
+    origin = st.text_input("Origen", value="USA", key="create_case_origin")
+    destination = st.text_input("Destino", value="Guatemala", key="create_case_dest")
 
 with c3:
-    notes = st.text_input("Notas (opcional)", value="")
+    notes = st.text_input("Notas (opcional)", value="", key="create_case_notes")
 
-create_btn = st.button("Crear trámite", type="primary")
-
-if create_btn:
+if st.button("Crear trámite", type="primary", key="create_case_btn"):
     try:
         cases_df = list_cases().fillna("")
         existing_ids = cases_df["case_id"].tolist() if "case_id" in cases_df.columns else []
@@ -159,7 +134,7 @@ if create_btn:
         )
 
         st.success(f"Trámite creado: {created_case_id}")
-        st.info(f"Carpeta Drive: {folder_name}")
+        st.info(f"Carpeta: {folder_name}")
         st.rerun()
 
     except Exception as e:
@@ -168,7 +143,7 @@ if create_btn:
 st.divider()
 
 # ---------------------------
-# Seleccionar trámite existente
+# Seleccionar trámite
 # ---------------------------
 st.subheader("Gestionar ítems del trámite")
 
@@ -177,20 +152,19 @@ if cases_df.empty:
     st.info("No hay trámites aún.")
     st.stop()
 
-cases_df["label"] = cases_df["case_id"].astype(str) + " — " + cases_df.get("destination", "").astype(str) + " — " + cases_df.get("status", "").astype(str)
-selected_case_id = st.selectbox("Selecciona un trámite", cases_df["case_id"].tolist())
-
+selected_case_id = st.selectbox("Selecciona un trámite", cases_df["case_id"].tolist(), key="case_select")
 case = get_case(str(selected_case_id))
 if not case:
     st.error("No se pudo cargar el trámite.")
     st.stop()
 
+case_id = case.get("case_id")
+items_df = list_items(case_id=case_id)
+items_df = items_df.fillna("") if items_df is not None else items_df
+
 st.write(f"**Trámite:** {case.get('case_id','')}")
 st.write(f"**Cliente ID:** {case.get('client_id','')}")
 st.write(f"**Drive folder:** {case.get('drive_folder_id','')}")
-
-items_df = list_items(case_id=case.get("case_id"))
-items_df = items_df.fillna("") if items_df is not None else items_df
 
 st.divider()
 st.subheader("Items registrados")
@@ -200,102 +174,100 @@ else:
     st.dataframe(items_df, use_container_width=True)
 
 # ---------------------------
-# Agregar VEHÍCULO (foto VIN → validar → confirmar → guardar)
+# VEHÍCULO por foto VIN
 # ---------------------------
 st.divider()
 st.subheader("Agregar vehículo (VIN por foto)")
 
-left, right = st.columns([1, 1])
+vin_image = st.file_uploader(
+    "Sube foto del VIN (desde cámara)",
+    type=["jpg", "jpeg", "png"],
+    key=f"vin_uploader_{case_id}"
+)
 
-with left:
-    vin_image = st.file_uploader("Sube foto del VIN (desde cámara)", type=["jpg", "jpeg", "png"])
+extract_btn = st.button("Extraer VIN de la foto", key=f"extract_vin_btn_{case_id}")
 
-    ocr_btn = st.button("Extraer VIN de la foto", type="secondary", disabled=(vin_image is None))
+if "vin_res" not in st.session_state:
+    st.session_state["vin_res"] = {"vin": "", "confidence": 0.0, "raw_text": "", "candidates": []}
 
-with right:
-    st.caption("Flujo: foto → OCR → confirmar VIN → (opcional) decode → confirmar datos → guardar")
-    st.caption("Regla: el VIN NO se puede repetir globalmente.")
+if extract_btn and vin_image is not None:
+    res = extract_vin_from_image(vin_image.getvalue())
+    st.session_state["vin_res"] = res
 
-if "vin_ocr_result" not in st.session_state:
-    st.session_state["vin_ocr_result"] = {"vin": "", "confidence": 0.0, "raw_text": ""}
+res = st.session_state.get("vin_res", {}) or {}
+cands = res.get("candidates", []) or []
+conf = float(res.get("confidence", 0.0) or 0.0)
 
-if ocr_btn and vin_image is not None:
-    if extract_vin_from_image is None:
-        st.error("No se pudo importar extract_vin_from_image desde transit_core.vin_ocr. Pega tu vin_ocr.py para conectarlo.")
-    else:
-        try:
-            res = extract_vin_from_image(vin_image.getvalue())
-            vin = normalize_vin(res.get("vin", ""))
-            st.session_state["vin_ocr_result"] = {
-                "vin": vin,
-                "confidence": float(res.get("confidence", 0.0) or 0.0),
-                "raw_text": str(res.get("raw_text", "") or ""),
-            }
-        except Exception as e:
-            st.error(f"OCR error: {type(e).__name__}: {e}")
+with st.expander("🧪 Debug OCR (texto leído)"):
+    st.text(res.get("raw_text", "") or "")
+    st.write("Candidatos:", cands)
 
-vin_guess = st.session_state["vin_ocr_result"]["vin"]
-conf = st.session_state["vin_ocr_result"]["confidence"]
+if cands:
+    vin_detected = st.selectbox(
+        "VIN detectados (elige el correcto)",
+        cands,
+        key=f"vin_candidates_{case_id}"
+    )
+else:
+    vin_detected = res.get("vin", "") or ""
 
-vin_input = st.text_input("VIN detectado (puedes corregirlo)", value=vin_guess)
+vin_input = st.text_input(
+    "VIN detectado (puedes corregirlo)",
+    value=vin_detected,
+    key=f"vin_input_{case_id}"
+)
+
 vin_input_norm = normalize_vin(vin_input)
 
-decode_btn = st.button("Decodificar VIN", type="secondary", disabled=(not vin_input_norm or not is_valid_vin(vin_input_norm)))
+decode_btn = st.button(
+    "Decodificar VIN",
+    key=f"decode_btn_{case_id}",
+    disabled=(not vin_input_norm or not is_valid_vin(vin_input_norm))
+)
 
-decoded = {}
+if "vin_decoded" not in st.session_state:
+    st.session_state["vin_decoded"] = {}
+
 if decode_btn:
-    if decode_vin is None:
-        st.error("No se pudo importar decode_vin desde transit_core.vin_decode. Pega tu vin_decode.py para conectarlo.")
-    else:
-        try:
-            decoded = decode_vin(vin_input_norm) or {}
-            st.session_state["vin_decoded"] = decoded
-        except Exception as e:
-            st.error(f"Decode error: {type(e).__name__}: {e}")
+    try:
+        st.session_state["vin_decoded"] = decode_vin(vin_input_norm) or {}
+    except Exception as e:
+        st.error(f"Decode error: {type(e).__name__}: {e}")
 
 decoded = st.session_state.get("vin_decoded", {}) or {}
 
 st.write(f"**Confianza OCR:** {conf:.2f}")
 
-cands = res.get("candidates", []) or []
-if cands:
-    vin_detected = st.selectbox("VIN detectados (elige el correcto)", cands)
-else:
-    vin_detected = res.get("vin", "")
-
-vin_input = st.text_input("VIN detectado (puedes corregirlo)", value=vin_detected)
-
-
-# Form editable
 veh_c1, veh_c2, veh_c3 = st.columns(3)
 with veh_c1:
-    brand = st.text_input("Marca", value=str(decoded.get("brand", "")))
+    brand = st.text_input("Marca", value=str(decoded.get("brand", "")), key=f"veh_brand_{case_id}")
 with veh_c2:
-    model = st.text_input("Modelo", value=str(decoded.get("model", "")))
+    model = st.text_input("Modelo", value=str(decoded.get("model", "")), key=f"veh_model_{case_id}")
 with veh_c3:
-    year = st.text_input("Año", value=str(decoded.get("year", "")))
+    year = st.text_input("Año", value=str(decoded.get("year", "")), key=f"veh_year_{case_id}")
 
 veh_c4, veh_c5, veh_c6 = st.columns(3)
 with veh_c4:
-    quantity = st.number_input("Cantidad", min_value=1, value=1, step=1)
+    quantity = st.number_input("Cantidad", min_value=1, value=1, step=1, key=f"veh_qty_{case_id}")
 with veh_c5:
-    weight = st.text_input("Peso (lb/kg)", value="")
+    weight = st.text_input("Peso (lb/kg)", value="", key=f"veh_weight_{case_id}")
 with veh_c6:
-    value = st.text_input("Valor (USD)", value="")
+    value = st.text_input("Valor (USD)", value="", key=f"veh_value_{case_id}")
 
-description = st.text_area("Descripción (opcional)", value="", height=80)
+description = st.text_area("Descripción (opcional)", value="", height=80, key=f"veh_desc_{case_id}")
 
-confirm_vehicle = st.checkbox("✅ Confirmo que el VIN y la información son correctos antes de guardar.", value=False)
+confirm_vehicle = st.checkbox(
+    "✅ Confirmo que el VIN y la información son correctos antes de guardar.",
+    value=False,
+    key=f"veh_confirm_{case_id}"
+)
 
-save_vehicle_btn = st.button("Guardar vehículo", type="primary", disabled=not confirm_vehicle)
-
-if save_vehicle_btn:
+if st.button("Guardar vehículo", type="primary", disabled=not confirm_vehicle, key=f"save_vehicle_{case_id}"):
     try:
         if not is_valid_vin(vin_input_norm):
             raise ValueError("VIN inválido. Debe tener 17 caracteres y no incluir I/O/Q.")
-        # add_vehicle_item ya valida duplicado global con _vin_exists_global
         add_vehicle_item(
-            case_id=case["case_id"],
+            case_id=case_id,
             vin=vin_input_norm,
             brand=brand,
             model=model,
@@ -308,83 +280,74 @@ if save_vehicle_btn:
         )
         st.success("Vehículo guardado.")
         st.session_state["vin_decoded"] = {}
-        st.session_state["vin_ocr_result"] = {"vin": "", "confidence": 0.0, "raw_text": ""}
+        st.session_state["vin_res"] = {"vin": "", "confidence": 0.0, "raw_text": "", "candidates": []}
         st.rerun()
     except Exception as e:
         st.error(f"Error guardando vehículo: {type(e).__name__}: {e}")
 
 # ---------------------------
-# Agregar ARTÍCULO (dictado / manual) + validación + “parte del vehículo”
+# ARTÍCULO por dictado/manual
 # ---------------------------
 st.divider()
 st.subheader("Agregar artículo (dictado)")
 
 st.caption(
-    "Usa el micrófono del teclado del celular para dictar aquí. "
     "Formato sugerido: ref: XXX | marca: YYY | modelo: ZZZ | peso: 3.5 lb | estado: usado | cantidad: 2 | parte_vehiculo: si | vin: 1HG..."
 )
 
-dictation = st.text_area("Dictado (o escribe manual)", height=90)
+dictation = st.text_area("Dictado (o escribe manual)", height=90, key=f"art_dict_{case_id}")
 parsed = _parse_article_dictation(dictation)
 
 art_c1, art_c2, art_c3 = st.columns(3)
 with art_c1:
-    art_ref = st.text_input("Serie/Referencia", value=parsed.get("ref", ""))
+    art_ref = st.text_input("Serie/Referencia", value=parsed.get("ref", ""), key=f"art_ref_{case_id}")
 with art_c2:
-    art_brand = st.text_input("Marca", value=parsed.get("brand", ""))
+    art_brand = st.text_input("Marca", value=parsed.get("brand", ""), key=f"art_brand_{case_id}")
 with art_c3:
-    art_model = st.text_input("Modelo", value=parsed.get("model", ""))
+    art_model = st.text_input("Modelo", value=parsed.get("model", ""), key=f"art_model_{case_id}")
 
 art_c4, art_c5, art_c6 = st.columns(3)
 with art_c4:
-    art_weight = st.text_input("Peso (lb/kg)", value=parsed.get("weight", ""))
+    art_weight = st.text_input("Peso (lb/kg)", value=parsed.get("weight", ""), key=f"art_weight_{case_id}")
 with art_c5:
-    art_condition = st.selectbox("Estado", options=["", "nuevo", "usado"], index=0 if not parsed.get("condition") else (1 if "nue" in parsed.get("condition","").lower() else 2))
+    art_condition = st.selectbox("Estado", options=["", "nuevo", "usado"], key=f"art_cond_{case_id}")
 with art_c6:
-    art_qty = st.number_input("Cantidad", min_value=1, value=int(parsed.get("quantity", 1) or 1), step=1)
+    art_qty = st.number_input("Cantidad", min_value=1, value=int(parsed.get("quantity", 1) or 1), step=1, key=f"art_qty_{case_id}")
 
-is_part = st.checkbox("¿Es parte del vehículo?", value=bool(parsed.get("is_vehicle_part", False)))
+is_part = st.checkbox("¿Es parte del vehículo?", value=bool(parsed.get("is_vehicle_part", False)), key=f"art_is_part_{case_id}")
 
 parent_vin = ""
 if is_part:
-    # Sugerimos elegir uno de los VIN ya registrados en este trámite
-    if items_df is not None and not items_df.empty and "item_type" in items_df.columns:
-        vins = items_df[items_df["item_type"] == "vehicle"]["unique_key"].tolist() if "unique_key" in items_df.columns else []
+    vins = []
+    if items_df is not None and not items_df.empty and "item_type" in items_df.columns and "unique_key" in items_df.columns:
+        vins = items_df[items_df["item_type"] == "vehicle"]["unique_key"].tolist()
         vins = [v for v in vins if v]
-    else:
-        vins = []
-
     if vins:
-        parent_vin = st.selectbox("Selecciona el VIN del vehículo al que pertenece", vins)
+        parent_vin = st.selectbox("Selecciona el VIN del vehículo al que pertenece", vins, key=f"art_parent_vin_sel_{case_id}")
     else:
-        parent_vin = st.text_input("VIN del vehículo (no hay vehículos registrados aún)", value=parsed.get("parent_vin",""))
+        parent_vin = st.text_input("VIN del vehículo (no hay vehículos registrados aún)", value=parsed.get("parent_vin",""), key=f"art_parent_vin_txt_{case_id}")
 
-art_value = st.text_input("Valor (USD)", value=parsed.get("value",""))
+art_value = st.text_input("Valor (USD)", value=parsed.get("value",""), key=f"art_value_{case_id}")
 art_desc_default = parsed.get("description","").strip()
-art_description = st.text_area("Descripción", value=art_desc_default, height=80)
+art_description = st.text_area("Descripción", value=art_desc_default, height=80, key=f"art_desc_{case_id}")
 
-confirm_article = st.checkbox("✅ Confirmo que la información del artículo es correcta antes de guardar.", value=False)
-save_article_btn = st.button("Guardar artículo", type="primary", disabled=not confirm_article)
+confirm_article = st.checkbox("✅ Confirmo que la información del artículo es correcta antes de guardar.", value=False, key=f"art_confirm_{case_id}")
 
-if save_article_btn:
+if st.button("Guardar artículo", type="primary", disabled=not confirm_article, key=f"save_article_{case_id}"):
     try:
-        # Si es parte del vehículo y nos dieron VIN, lo añadimos en la descripción por ahora (sin cambiar DB)
-        # Luego, si quieres, agregamos columnas parent_vin / is_vehicle_part en items.
         desc = art_description.strip()
         if is_part:
             pv = normalize_vin(parent_vin)
             if pv and is_valid_vin(pv):
                 desc = f"[PARTE_DE_VEHICULO:{pv}] {desc}".strip()
             else:
-                # Permitimos guardar pero advertimos
                 desc = f"[PARTE_DE_VEHICULO] {desc}".strip()
 
-        # Incluimos referencia en la descripción si no está
         if art_ref and art_ref not in desc:
             desc = f"{art_ref} | {desc}".strip(" |")
 
         add_article_item(
-            case_id=case["case_id"],
+            case_id=case_id,
             description=desc,
             brand=art_brand,
             model=art_model,
