@@ -257,6 +257,15 @@ decoded = st.session_state.get("vin_decoded", {}) or {}
 
 st.write(f"**Confianza OCR:** {conf:.2f}")
 
+cands = res.get("candidates", []) or []
+if cands:
+    vin_detected = st.selectbox("VIN detectados (elige el correcto)", cands)
+else:
+    vin_detected = res.get("vin", "")
+
+vin_input = st.text_input("VIN detectado (puedes corregirlo)", value=vin_detected)
+
+
 # Form editable
 veh_c1, veh_c2, veh_c3 = st.columns(3)
 with veh_c1:
