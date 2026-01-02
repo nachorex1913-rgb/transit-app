@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional, Any, Dict
+from typing import Optional, Any
 
 import pandas as pd
 import gspread
@@ -11,22 +11,22 @@ import streamlit as st
 import time
 import random
 
-from .ids import next_case_id, next_item_id, next_doc_id, next_article_seq
+from .ids import next_case_id, next_article_seq, next_item_id, next_doc_id
 from .validators import is_valid_vin, normalize_vin
 
 
 SHEETS = {
     "clients": ["client_id","name","address","id_type","id_number","phone","email","country_destination","created_at","updated_at"],
-    # ✅ Agregamos case_name (nombre visible)
-    "cases": ["case_id","client_id","case_name","case_date","status","origin","destination","notes","drive_folder_id","created_at","updated_at","final_pdf_drive_id","final_pdf_uploaded_at"],
-    # ✅ Agregamos case_seq (consecutivo por trámite)
-    "items": ["item_id","case_id","case_seq","item_type","unique_key","brand","model","year","description","quantity","weight","value","source","created_at"],
+    # ✅ agregado: case_name (obligatorio, será el nombre del cliente)
+    "cases": ["case_id","case_name","client_id","case_date","status","origin","destination","notes","drive_folder_id","created_at","updated_at","final_pdf_drive_id","final_pdf_uploaded_at"],
+    # ✅ agregado: case_seq (consecutivo por trámite) + parent_vin (para artículos parte de vehículo) + fingerprint (opcional para dedupe)
+    "items": ["item_id","case_id","case_seq","item_type","unique_key","brand","model","year","description","quantity","weight","value","parent_vin","fingerprint","source","created_at"],
     "documents": ["doc_id","case_id","item_id","doc_type","drive_file_id","file_name","uploaded_at"],
     "audit_log": ["log_id","timestamp","user","action","entity","entity_id","details"],
     "oauth_tokens": ["key","value"],
 }
 
-DEFAULT_STATUS = "BORRADOR"
+DEFAULT_STATUS = "Borrador"
 
 
 def _now_iso() -> str:
@@ -101,7 +101,7 @@ def init_db(force: bool = False) -> None:
             last_err = None
             for attempt in range(6):
                 try:
-                    ws = ss.add_worksheet(title=tab, rows=3000, cols=max(10, len(headers) + 2))
+                    ws = ss.add_worksheet(title=tab, rows=2000, cols=max(10, len(headers) + 2))
                     ws.append_row(headers)
                     break
                 except gspread.exceptions.APIError as e:
@@ -256,7 +256,7 @@ def list_cases() -> pd.DataFrame:
 
 def create_case(
     client_id: str,
-    case_name: str,
+    case_name: str,  # ✅ obligatorio
     origin: str = "USA",
     destination: str = "",
     notes: str = "",
@@ -274,11 +274,7 @@ def create_case(
     now = _now_iso()
     cdate = case_date or datetime.now().date().isoformat()
 
-    row = [
-        case_id, client_id, case_name, cdate, status,
-        origin, destination, notes, drive_folder_id or "",
-        now, now, "", ""
-    ]
+    row = [case_id, case_name, client_id, cdate, status, origin, destination, notes, drive_folder_id or "", now, now, "", ""]
     _append("cases", row)
     return case_id
 
@@ -311,10 +307,6 @@ def update_case_fields(case_id: str, fields: dict) -> None:
             col = headers.index(k) + 1
             updates.append((row, col, "" if v is None else str(v)))
 
-    if "updated_at" in headers:
-        col = headers.index("updated_at") + 1
-        updates.append((row, col, _now_iso()))
-
     if not updates:
         return
 
@@ -344,20 +336,15 @@ def _vin_exists_global(vin: str) -> bool:
 
 
 def _next_case_seq(case_id: str) -> int:
-    """
-    Consecutivo por trámite (empieza en 1).
-    """
     records = _get_all_records("items")
-    max_seq = 0
+    mx = 0
     for r in records:
-        if str(r.get("case_id","")) != str(case_id):
-            continue
-        try:
-            s = int(str(r.get("case_seq","") or "0"))
-            max_seq = max(max_seq, s)
-        except Exception:
-            pass
-    return max_seq + 1
+        if str(r.get("case_id","")) == str(case_id):
+            try:
+                mx = max(mx, int(r.get("case_seq") or 0))
+            except Exception:
+                pass
+    return mx + 1
 
 
 def add_vehicle_item(
@@ -371,6 +358,7 @@ def add_vehicle_item(
     weight: str = "",
     value: str = "",
     source: str = "manual",
+    fingerprint: str = "",
 ) -> str:
     init_db()
     v = normalize_vin(vin)
@@ -380,8 +368,7 @@ def add_vehicle_item(
         raise ValueError("Este VIN ya existe en el sistema (no se puede duplicar).")
 
     items_ws = _ws("items")
-    records = items_ws.get_all_records()
-    existing_item_ids = [r.get("item_id","") for r in records]
+    existing_item_ids = [r.get("item_id","") for r in items_ws.get_all_records()]
     item_id = next_item_id(existing_item_ids)
     now = _now_iso()
 
@@ -390,7 +377,8 @@ def add_vehicle_item(
     row = [
         item_id, case_id, case_seq, "vehicle", v,
         brand, model, year, description,
-        int(quantity or 1), weight, value, source, now
+        int(quantity or 1), weight, value,
+        "", fingerprint, source, now
     ]
     _append("items", row)
     return item_id
@@ -406,35 +394,26 @@ def add_article_item(
     value: str = "",
     parent_vin: str = "",
     source: str = "manual",
+    fingerprint: str = "",
 ) -> str:
     init_db()
     items_ws = _ws("items")
     records = items_ws.get_all_records()
-
     existing_item_ids = [r.get("item_id","") for r in records]
-
-    # keys por case para seq del artículo (A-TR...-0001)
-    existing_keys_case = [
-        str(r.get("unique_key",""))
-        for r in records
-        if str(r.get("case_id","")) == str(case_id) and str(r.get("item_type","")) == "article"
-    ]
+    existing_keys = [r.get("unique_key","") for r in records if str(r.get("case_id","")) == case_id]
 
     item_id = next_item_id(existing_item_ids)
-    seq = next_article_seq(existing_keys_case, case_id=case_id)
+    seq = next_article_seq(existing_keys, case_id=case_id)  # tu unique_key interno
     now = _now_iso()
 
     case_seq = _next_case_seq(case_id)
 
-    desc_final = (description or "").strip()
-    pv = normalize_vin(parent_vin) if parent_vin else ""
-    if pv:
-        desc_final = f"[PARTE_DE_VEHICULO:{pv}] {desc_final}".strip()
-
     row = [
         item_id, case_id, case_seq, "article", seq,
-        brand, model, "", desc_final,
-        int(quantity or 1), weight, value, source, now
+        brand, model, "", description,
+        int(quantity or 1), weight, value,
+        normalize_vin(parent_vin) if parent_vin else "",
+        fingerprint, source, now
     ]
     _append("items", row)
     return item_id
