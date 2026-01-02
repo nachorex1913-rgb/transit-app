@@ -1,14 +1,14 @@
 # transit_core/vin_decode.py
 from __future__ import annotations
 
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 import requests
 
 from .validators import normalize_vin, is_valid_vin
 
-VIN_DECODE_VERSION = "VIN_DECODE_GENERIC_v1_2026-01-02"
+VIN_DECODE_VERSION = "VIN_DECODE_GENERIC_v2_2026-01-02"
 
-# Tabla WMI mínima (ampliable). Si no está, devolvemos WMI y dejamos brand vacío.
+# Tabla WMI mínima (ampliable). Si no está, devolvemos WMI y dejamos brand/make vacío.
 _WMI_BRAND = {
     # HONDA/ACURA
     "JHM": "HONDA", "1HG": "HONDA", "2HG": "HONDA", "JH4": "ACURA",
@@ -41,16 +41,26 @@ _YEAR_2010_2039 = {
     "8": 2038, "9": 2039,
 }
 
+def _clean(v: Optional[str]) -> str:
+    """Limpia strings típicos de vPIC ('null', 'N/A', etc.)"""
+    if v is None:
+        return ""
+    s = str(v).strip()
+    if not s:
+        return ""
+    low = s.lower()
+    if low in {"null", "none", "n/a", "na", "not applicable", "unknown"}:
+        return ""
+    return s
+
 def _brand_from_wmi(vin: str) -> str:
     return _WMI_BRAND.get(vin[:3], "")
 
-def _year_candidates(vin: str) -> list[int]:
+def _year_candidates(vin: str) -> List[int]:
     code = vin[9]  # posición 10
     y1 = _YEAR_1980_2009.get(code)
     y2 = _YEAR_2010_2039.get(code)
-    # Para dígitos preferimos 2001-2009 (y1) como primer candidato.
-    # Para letras devolvemos ambos candidatos.
-    out = []
+    out: List[int] = []
     if y1 is not None:
         out.append(y1)
     if y2 is not None and y2 != y1:
@@ -58,34 +68,51 @@ def _year_candidates(vin: str) -> list[int]:
     return out
 
 def _decode_nhtsa(vin: str) -> Dict[str, Any]:
+    """
+    NHTSA vPIC:
+    - Usamos DecodeVinValuesExtended
+    - Devolvemos llaves normalizadas y compatibilidad (make/brand)
+    """
     url = f"https://vpic.nhtsa.dot.gov/api/vehicles/decodevinvaluesextended/{vin}?format=json"
     r = requests.get(url, timeout=15)
     r.raise_for_status()
     payload = r.json()
+
     results = payload.get("Results") or []
     row = results[0] if results else {}
 
-    make = (row.get("Make") or "").strip()
-    model = (row.get("Model") or "").strip()
-    year = (row.get("ModelYear") or "").strip()
+    make = _clean(row.get("Make"))
+    model = _clean(row.get("Model"))
+    year = _clean(row.get("ModelYear"))
 
-    err_text = (row.get("ErrorText") or "").strip()
-    err_code = (row.get("ErrorCode") or "").strip()
+    err_text = _clean(row.get("ErrorText"))
+    err_code = _clean(row.get("ErrorCode"))
 
     # Si NO trae nada útil, tratamos como "sin data"
     if not (make or model or year):
-        return {"error": "NHTSA_NO_DATA", "raw_error_text": err_text, "raw_error_code": err_code}
+        return {
+            "error": "NHTSA_NO_DATA",
+            "raw_error_text": err_text,
+            "raw_error_code": err_code,
+        }
+
+    trim = _clean(row.get("Trim")) or _clean(row.get("Series"))
+    engine = _clean(row.get("EngineModel")) or _clean(row.get("EngineConfiguration"))
 
     return {
-        "brand": make,
+        "vin": vin,
+        "make": make,       # COMPAT UI
+        "brand": make,      # TU convención
         "model": model,
         "year": year,
-        "trim": (row.get("Trim") or row.get("Series") or "").strip(),
-        "engine": (row.get("EngineModel") or row.get("EngineConfiguration") or "").strip(),
-        "vehicle_type": (row.get("VehicleType") or "").strip(),
-        "body_class": (row.get("BodyClass") or "").strip(),
-        "plant_country": (row.get("PlantCountry") or "").strip(),
+        "trim": trim,
+        "engine": engine,
+        "vehicle_type": _clean(row.get("VehicleType")),
+        "body_class": _clean(row.get("BodyClass")),
+        "plant_country": _clean(row.get("PlantCountry")),
         "source": "nhtsa",
+        "nhtsa_error_text": err_text,
+        "nhtsa_error_code": err_code,
     }
 
 def decode_vin(vin: str) -> Dict[str, Any]:
@@ -93,61 +120,81 @@ def decode_vin(vin: str) -> Dict[str, Any]:
     Pipeline genérico:
     1) NHTSA (vPIC) -> si trae algo útil, usarlo.
     2) Si NHTSA vacío/falla -> fallback OFFLINE:
-       - brand por WMI (si la tabla lo conoce)
+       - make/brand por WMI (si la tabla lo conoce)
        - year_candidates por código de año (pos 10)
        - model siempre vacío (no se inventa)
     """
+
     v = normalize_vin(vin)
 
-    if not v:
-        return {"error": "VIN vacío", "version": VIN_DECODE_VERSION}
-    if len(v) != 17:
-        return {"error": f"VIN debe tener 17 caracteres. Actual: {len(v)}", "version": VIN_DECODE_VERSION}
-    if not is_valid_vin(v):
-        return {"error": "VIN inválido (A-Z/0-9, sin I/O/Q)", "version": VIN_DECODE_VERSION}
-
-    # 1) NHTSA
-    nhtsa_status = ""
-    nhtsa_text = ""
-    nhtsa_code = ""
-    try:
-        out = _decode_nhtsa(v)
-        if not out.get("error"):
-            out["version"] = VIN_DECODE_VERSION
-            return out
-        nhtsa_status = out.get("error", "")
-        nhtsa_text = out.get("raw_error_text", "")
-        nhtsa_code = out.get("raw_error_code", "")
-    except Exception as e:
-        nhtsa_status = f"NHTSA_FAIL: {type(e).__name__}: {e}"
-
-    # 2) OFFLINE fallback
-    brand = _brand_from_wmi(v)
-    years = _year_candidates(v)
-
-    # Si no podemos inferir nada, devolvemos error (y obligas manual)
-    if not brand and not years:
-        return {
-            "error": "NHTSA sin datos y fallback offline sin inferencias. Ingresa manual.",
-            "version": VIN_DECODE_VERSION,
-            "nhtsa_status": nhtsa_status,
-        }
-
-    return {
-        "brand": brand,              # puede venir vacío si WMI no está en tabla
-        "model": "",                 # NO inventar
-        "year": str(years[0]) if years else "",
-        "year_candidates": [str(y) for y in years],
+    base: Dict[str, Any] = {
+        "vin": v or "",
+        "make": "",
+        "brand": "",
+        "model": "",
+        "year": "",
         "trim": "",
         "engine": "",
         "vehicle_type": "",
         "body_class": "",
         "plant_country": "",
-        "source": "offline_fallback",
-        "note": "NHTSA no devolvió datos completos. Se inferió marca/año por estructura VIN (si posible). Modelo manual.",
-        "wmi": v[:3],
-        "nhtsa_status": nhtsa_status,
-        "nhtsa_error_text": nhtsa_text,
-        "nhtsa_error_code": nhtsa_code,
+        "source": "none",
         "version": VIN_DECODE_VERSION,
+        "error": "",
     }
+
+    if not v:
+        base["error"] = "VIN vacío"
+        return base
+    if len(v) != 17:
+        base["error"] = f"VIN debe tener 17 caracteres. Actual: {len(v)}"
+        return base
+    if not is_valid_vin(v):
+        base["error"] = "VIN inválido (A-Z/0-9, sin I/O/Q)"
+        return base
+
+    # 1) NHTSA
+    nhtsa_status = ""
+    try:
+        out = _decode_nhtsa(v)
+        if not out.get("error"):
+            out["version"] = VIN_DECODE_VERSION
+            # Garantizar compatibilidad: make + brand siempre
+            out["make"] = out.get("make", "") or out.get("brand", "")
+            out["brand"] = out.get("brand", "") or out.get("make", "")
+            out["source"] = "nhtsa"
+            out["error"] = ""
+            return out
+
+        nhtsa_status = out.get("error", "")
+        base["nhtsa_status"] = nhtsa_status
+        base["nhtsa_error_text"] = out.get("raw_error_text", "")
+        base["nhtsa_error_code"] = out.get("raw_error_code", "")
+
+    except Exception as e:
+        nhtsa_status = f"NHTSA_FAIL: {type(e).__name__}: {e}"
+        base["nhtsa_status"] = nhtsa_status
+
+    # 2) OFFLINE fallback
+    inferred_brand = _brand_from_wmi(v)
+    years = _year_candidates(v)
+
+    # Si no podemos inferir nada, devolvemos error (y obligas manual)
+    if not inferred_brand and not years:
+        base["error"] = "NHTSA sin datos y fallback offline sin inferencias. Ingresa manual."
+        base["source"] = "none"
+        return base
+
+    base["make"] = inferred_brand
+    base["brand"] = inferred_brand
+    base["model"] = ""  # NO inventar
+    base["year"] = str(years[0]) if years else ""
+    base["year_candidates"] = [str(y) for y in years]
+    base["source"] = "offline_fallback"
+    base["note"] = (
+        "NHTSA no devolvió datos completos. "
+        "Se infirió marca/año por estructura VIN (si posible). Modelo manual."
+    )
+    base["wmi"] = v[:3]
+    base["error"] = ""  # no es error fatal si hay inferencia útil
+    return base
