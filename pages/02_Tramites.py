@@ -248,6 +248,7 @@ if decode_btn:
         st.error(out["error"])
         st.session_state[vin_decoded_key] = {}
         decoded = {}
+        st.write("VIN decode output:", out)
     else:
         st.session_state[vin_decoded_key] = out
         decoded = out
