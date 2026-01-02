@@ -187,10 +187,9 @@ vin_image = st.file_uploader(
 
 extract_btn = st.button("Extraer VIN de la foto", key=f"extract_vin_btn_{case_id}")
 
-# state aislado por trámite
 vin_res_key = f"vin_res_{case_id}"
 vin_decoded_key = f"vin_decoded_{case_id}"
-vin_last_key = f"vin_last_{case_id}"  # para detectar cambio de VIN y limpiar
+vin_last_key = f"vin_last_{case_id}"
 
 veh_brand_key = f"veh_brand_{case_id}"
 veh_model_key = f"veh_model_{case_id}"
@@ -240,11 +239,9 @@ vin_input = st.text_input(
 
 vin_input_norm = normalize_vin(vin_input)
 
-# Si el VIN cambió respecto al último, limpiamos decoded (para evitar mezcla)
 if vin_input_norm and vin_input_norm != st.session_state.get(vin_last_key, ""):
     st.session_state[vin_last_key] = vin_input_norm
     st.session_state[vin_decoded_key] = {}
-    # OJO: no limpiamos lo que el usuario ya escribió manual en marca/modelo/año
 
 decode_btn = st.button(
     "Decodificar VIN",
@@ -257,7 +254,6 @@ decoded = st.session_state.get(vin_decoded_key, {}) or {}
 if decode_btn:
     out = decode_vin(vin_input_norm) or {}
 
-    # Si hay error, NO success
     if out.get("error"):
         st.warning(out["error"])
         st.session_state[vin_decoded_key] = {}
@@ -266,15 +262,10 @@ if decode_btn:
         st.session_state[vin_decoded_key] = out
         decoded = out
 
-        # ✅ ESTE ES EL FIX REAL:
-        # Empujar datos decodificados a los inputs (session_state de los widgets).
-        # Si el usuario ya escribió manualmente, esto igual lo va a actualizar con lo decodificado
-        # (que es lo que quieres al presionar "Decodificar VIN").
         st.session_state[veh_brand_key] = str(decoded.get("brand", "") or "")
         st.session_state[veh_model_key] = str(decoded.get("model", "") or "")
         st.session_state[veh_year_key] = str(decoded.get("year", "") or "")
 
-        # success SOLO si vino algo útil
         if (st.session_state[veh_brand_key].strip()
             or st.session_state[veh_model_key].strip()
             or st.session_state[veh_year_key].strip()):
@@ -289,7 +280,6 @@ if vin_input_norm and len(vin_input_norm) == 17 and not is_valid_vin(vin_input_n
 with st.expander("🧪 Debug Decode"):
     st.json(decoded)
 
-# Asegurar defaults iniciales (solo si no existen aún)
 if veh_brand_key not in st.session_state:
     st.session_state[veh_brand_key] = ""
 if veh_model_key not in st.session_state:
@@ -349,6 +339,7 @@ if st.button("Guardar vehículo", type="primary", disabled=not confirm_vehicle, 
     except Exception as e:
         st.error(f"Error guardando vehículo: {type(e).__name__}: {e}")
 
+
 # ---------------------------
 # ARTÍCULO por dictado/manual
 # ---------------------------
@@ -359,26 +350,83 @@ st.caption(
     "Formato sugerido: ref: XXX | marca: YYY | modelo: ZZZ | peso: 3.5 lb | estado: usado | cantidad: 2 | parte_vehiculo: si | vin: 1HG..."
 )
 
+# Keys consistentes (para poder escribir en session_state y que sí llene)
+art_ref_key = f"art_ref_{case_id}"
+art_brand_key = f"art_brand_{case_id}"
+art_model_key = f"art_model_{case_id}"
+art_weight_key = f"art_weight_{case_id}"
+art_value_key = f"art_value_{case_id}"
+art_desc_key = f"art_desc_{case_id}"
+art_qty_key = f"art_qty_{case_id}"
+art_is_part_key = f"art_is_part_{case_id}"
+art_parent_vin_txt_key = f"art_parent_vin_txt_{case_id}"
+art_parent_vin_sel_key = f"art_parent_vin_sel_{case_id}"
+
+# Inicializar defaults SOLO si no existen
+if art_ref_key not in st.session_state:
+    st.session_state[art_ref_key] = ""
+if art_brand_key not in st.session_state:
+    st.session_state[art_brand_key] = ""
+if art_model_key not in st.session_state:
+    st.session_state[art_model_key] = ""
+if art_weight_key not in st.session_state:
+    st.session_state[art_weight_key] = ""
+if art_value_key not in st.session_state:
+    st.session_state[art_value_key] = ""
+if art_desc_key not in st.session_state:
+    st.session_state[art_desc_key] = ""
+if art_qty_key not in st.session_state:
+    st.session_state[art_qty_key] = 1
+if art_is_part_key not in st.session_state:
+    st.session_state[art_is_part_key] = False
+if art_parent_vin_txt_key not in st.session_state:
+    st.session_state[art_parent_vin_txt_key] = ""
+
 dictation = st.text_area("Dictado (o escribe manual)", height=90, key=f"art_dict_{case_id}")
 parsed = _parse_article_dictation(dictation)
 
+# Botón que realmente hace que el dictado “sirva”
+apply_dict_btn = st.button("Aplicar dictado a campos", key=f"apply_dict_{case_id}")
+
+if apply_dict_btn:
+    st.session_state[art_ref_key] = parsed.get("ref", "") or ""
+    st.session_state[art_brand_key] = parsed.get("brand", "") or ""
+    st.session_state[art_model_key] = parsed.get("model", "") or ""
+    st.session_state[art_weight_key] = parsed.get("weight", "") or ""
+    st.session_state[art_value_key] = parsed.get("value", "") or ""
+    st.session_state[art_desc_key] = (parsed.get("description", "") or "").strip()
+    try:
+        st.session_state[art_qty_key] = int(parsed.get("quantity", 1) or 1)
+    except Exception:
+        st.session_state[art_qty_key] = 1
+    st.session_state[art_is_part_key] = bool(parsed.get("is_vehicle_part", False))
+
+    pv = normalize_vin(parsed.get("parent_vin", "") or "")
+    if pv:
+        st.session_state[art_parent_vin_txt_key] = pv
+
+    st.success("Dictado aplicado a los campos.")
+
+with st.expander("🧪 Debug dictado parseado"):
+    st.json(parsed)
+
 art_c1, art_c2, art_c3 = st.columns(3)
 with art_c1:
-    art_ref = st.text_input("Serie/Referencia", value=parsed.get("ref", ""), key=f"art_ref_{case_id}")
+    art_ref = st.text_input("Serie/Referencia", key=art_ref_key)
 with art_c2:
-    art_brand = st.text_input("Marca", value=parsed.get("brand", ""), key=f"art_brand_{case_id}")
+    art_brand = st.text_input("Marca", key=art_brand_key)
 with art_c3:
-    art_model = st.text_input("Modelo", value=parsed.get("model", ""), key=f"art_model_{case_id}")
+    art_model = st.text_input("Modelo", key=art_model_key)
 
 art_c4, art_c5, art_c6 = st.columns(3)
 with art_c4:
-    art_weight = st.text_input("Peso (lb/kg)", value=parsed.get("weight", ""), key=f"art_weight_{case_id}")
+    art_weight = st.text_input("Peso (lb/kg)", key=art_weight_key)
 with art_c5:
     art_condition = st.selectbox("Estado", options=["", "nuevo", "usado"], key=f"art_cond_{case_id}")
 with art_c6:
-    art_qty = st.number_input("Cantidad", min_value=1, value=int(parsed.get("quantity", 1) or 1), step=1, key=f"art_qty_{case_id}")
+    art_qty = st.number_input("Cantidad", min_value=1, value=int(st.session_state[art_qty_key]), step=1, key=art_qty_key)
 
-is_part = st.checkbox("¿Es parte del vehículo?", value=bool(parsed.get("is_vehicle_part", False)), key=f"art_is_part_{case_id}")
+is_part = st.checkbox("¿Es parte del vehículo?", key=art_is_part_key)
 
 parent_vin = ""
 if is_part:
@@ -386,14 +434,21 @@ if is_part:
     if items_df is not None and not items_df.empty and "item_type" in items_df.columns and "unique_key" in items_df.columns:
         vins = items_df[items_df["item_type"] == "vehicle"]["unique_key"].tolist()
         vins = [v for v in vins if v]
-    if vins:
-        parent_vin = st.selectbox("Selecciona el VIN del vehículo al que pertenece", vins, key=f"art_parent_vin_sel_{case_id}")
-    else:
-        parent_vin = st.text_input("VIN del vehículo (no hay vehículos registrados aún)", value=parsed.get("parent_vin", ""), key=f"art_parent_vin_txt_{case_id}")
 
-art_value = st.text_input("Valor (USD)", value=parsed.get("value", ""), key=f"art_value_{case_id}")
-art_desc_default = parsed.get("description", "").strip()
-art_description = st.text_area("Descripción", value=art_desc_default, height=80, key=f"art_desc_{case_id}")
+    if vins:
+        parent_vin = st.selectbox(
+            "Selecciona el VIN del vehículo al que pertenece",
+            vins,
+            key=art_parent_vin_sel_key
+        )
+    else:
+        parent_vin = st.text_input(
+            "VIN del vehículo (no hay vehículos registrados aún)",
+            key=art_parent_vin_txt_key
+        )
+
+art_value = st.text_input("Valor (USD)", key=art_value_key)
+art_description = st.text_area("Descripción", height=80, key=art_desc_key)
 
 confirm_article = st.checkbox(
     "✅ Confirmo que la información del artículo es correcta antes de guardar.",
@@ -403,7 +458,7 @@ confirm_article = st.checkbox(
 
 if st.button("Guardar artículo", type="primary", disabled=not confirm_article, key=f"save_article_{case_id}"):
     try:
-        desc = art_description.strip()
+        desc = (art_description or "").strip()
 
         if is_part:
             pv = normalize_vin(parent_vin)
