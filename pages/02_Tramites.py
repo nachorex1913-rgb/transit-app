@@ -246,12 +246,13 @@ if vin_decoded_key not in st.session_state:
     st.session_state[vin_decoded_key] = {}
 
 if decode_btn:
-    try:
-        st.session_state[vin_decoded_key] = decode_vin(vin_input_norm) or {}
-    except Exception as e:
-        st.error(f"Decode error: {type(e).__name__}: {e}")
-
-decoded = st.session_state.get(vin_decoded_key, {}) or {}
+    out = decode_vin(vin_input_norm) or {}
+    if out.get("error"):
+        st.error(out["error"])
+        st.session_state[vin_decoded_key] = {}
+    else:
+        st.session_state[vin_decoded_key] = out
+        st.success("VIN decodificado correctamente.")
 
 st.write(f"**Confianza OCR:** {conf:.2f}")
 
