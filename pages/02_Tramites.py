@@ -1,4 +1,3 @@
-
 import re
 import streamlit as st
 from datetime import datetime
@@ -191,12 +190,20 @@ extract_btn = st.button("Extraer VIN de la foto", key=f"extract_vin_btn_{case_id
 # state aislado por trámite
 vin_res_key = f"vin_res_{case_id}"
 vin_decoded_key = f"vin_decoded_{case_id}"
+vin_last_key = f"vin_last_{case_id}"  # para detectar cambio de VIN y limpiar
+
+veh_brand_key = f"veh_brand_{case_id}"
+veh_model_key = f"veh_model_{case_id}"
+veh_year_key = f"veh_year_{case_id}"
 
 if vin_res_key not in st.session_state:
     st.session_state[vin_res_key] = {"vin": "", "confidence": 0.0, "raw_text": "", "candidates": [], "error": ""}
 
 if vin_decoded_key not in st.session_state:
     st.session_state[vin_decoded_key] = {}
+
+if vin_last_key not in st.session_state:
+    st.session_state[vin_last_key] = ""
 
 if extract_btn:
     if vin_image is None:
@@ -233,20 +240,24 @@ vin_input = st.text_input(
 
 vin_input_norm = normalize_vin(vin_input)
 
-decode_disabled = (not vin_input_norm) or (len(vin_input_norm) != 17)
+# Si el VIN cambió respecto al último, limpiamos decoded (para evitar mezcla)
+if vin_input_norm and vin_input_norm != st.session_state.get(vin_last_key, ""):
+    st.session_state[vin_last_key] = vin_input_norm
+    st.session_state[vin_decoded_key] = {}
+    # OJO: no limpiamos lo que el usuario ya escribió manual en marca/modelo/año
+
 decode_btn = st.button(
     "Decodificar VIN",
     key=f"decode_btn_{case_id}",
     disabled=(not vin_input_norm or len(vin_input_norm) != 17),
 )
 
-# SIEMPRE existe decoded
 decoded = st.session_state.get(vin_decoded_key, {}) or {}
 
 if decode_btn:
     out = decode_vin(vin_input_norm) or {}
 
-    # ✅ Si hay error, NO success
+    # Si hay error, NO success
     if out.get("error"):
         st.warning(out["error"])
         st.session_state[vin_decoded_key] = {}
@@ -255,8 +266,18 @@ if decode_btn:
         st.session_state[vin_decoded_key] = out
         decoded = out
 
-        # ✅ success SOLO si vino algo útil
-        if (decoded.get("brand") or "").strip() or (decoded.get("model") or "").strip() or (decoded.get("year") or "").strip():
+        # ✅ ESTE ES EL FIX REAL:
+        # Empujar datos decodificados a los inputs (session_state de los widgets).
+        # Si el usuario ya escribió manualmente, esto igual lo va a actualizar con lo decodificado
+        # (que es lo que quieres al presionar "Decodificar VIN").
+        st.session_state[veh_brand_key] = str(decoded.get("brand", "") or "")
+        st.session_state[veh_model_key] = str(decoded.get("model", "") or "")
+        st.session_state[veh_year_key] = str(decoded.get("year", "") or "")
+
+        # success SOLO si vino algo útil
+        if (st.session_state[veh_brand_key].strip()
+            or st.session_state[veh_model_key].strip()
+            or st.session_state[veh_year_key].strip()):
             st.success("VIN decodificado correctamente.")
         else:
             st.warning("Se consultó el decoder pero no devolvió datos útiles. Ingresa manual.")
@@ -265,13 +286,24 @@ st.write(f"**Confianza OCR:** {conf:.2f}")
 if vin_input_norm and len(vin_input_norm) == 17 and not is_valid_vin(vin_input_norm):
     st.warning("VIN inválido (contiene I/O/Q o caracteres no permitidos). Verifica antes de guardar.")
 
+with st.expander("🧪 Debug Decode"):
+    st.json(decoded)
+
+# Asegurar defaults iniciales (solo si no existen aún)
+if veh_brand_key not in st.session_state:
+    st.session_state[veh_brand_key] = ""
+if veh_model_key not in st.session_state:
+    st.session_state[veh_model_key] = ""
+if veh_year_key not in st.session_state:
+    st.session_state[veh_year_key] = ""
+
 veh_c1, veh_c2, veh_c3 = st.columns(3)
 with veh_c1:
-    brand = st.text_input("Marca", value=str(decoded.get("brand", "")), key=f"veh_brand_{case_id}")
+    brand = st.text_input("Marca", key=veh_brand_key)
 with veh_c2:
-    model = st.text_input("Modelo", value=str(decoded.get("model", "")), key=f"veh_model_{case_id}")
+    model = st.text_input("Modelo", key=veh_model_key)
 with veh_c3:
-    year = st.text_input("Año", value=str(decoded.get("year", "")), key=f"veh_year_{case_id}")
+    year = st.text_input("Año", key=veh_year_key)
 
 veh_c4, veh_c5, veh_c6 = st.columns(3)
 with veh_c4:
