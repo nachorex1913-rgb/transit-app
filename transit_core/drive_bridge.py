@@ -1,13 +1,12 @@
 # transit_core/drive_bridge.py
 from __future__ import annotations
 
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 import base64
 import requests
 import streamlit as st
 
-
-DRIVE_BRIDGE_VERSION = "DRIVE_BRIDGE_APPS_SCRIPT_v2_2026-01-02"
+DRIVE_BRIDGE_VERSION = "DRIVE_BRIDGE_APPS_SCRIPT_v3_2026-01-02"
 
 
 def _script_url() -> str:
@@ -25,9 +24,6 @@ def _script_token() -> str:
 
 
 def create_case_folder_via_script(root_folder_id: str, case_id: str, folder_name: str) -> Dict[str, Any]:
-    """
-    Crea carpeta del caso en Drive usando Apps Script Web App.
-    """
     payload = {
         "token": _script_token(),
         "action": "create_case_folder",
@@ -51,18 +47,6 @@ def upload_file_to_case_folder_via_script(
     mime_type: str = "application/octet-stream",
     subfolder: str = "",
 ) -> Dict[str, Any]:
-    """
-    Sube archivo a la carpeta del caso (Drive) usando Apps Script Web App.
-
-    Devuelve:
-      {
-        ok: True,
-        file_id: "...",
-        file_name: "...",
-        webViewLink: "...",
-        ...
-      }
-    """
     if not case_folder_id:
         raise ValueError("case_folder_id vacío. No se puede subir archivo.")
 
@@ -84,3 +68,20 @@ def upload_file_to_case_folder_via_script(
     if not data.get("ok"):
         raise RuntimeError(f"Drive Script upload error: {data}")
     return data
+
+
+# -----------------------------
+# Aliases (compatibilidad)
+# -----------------------------
+def create_case_folder(*args, **kwargs):
+    return create_case_folder_via_script(*args, **kwargs)
+
+
+def upload_file_via_script(*args, **kwargs):
+    # alias genérico
+    return upload_file_to_case_folder_via_script(*args, **kwargs)
+
+
+def upload_file_to_drive_via_script(*args, **kwargs):
+    # alias por si en PDF o Documentos importaban esto
+    return upload_file_to_case_folder_via_script(*args, **kwargs)
