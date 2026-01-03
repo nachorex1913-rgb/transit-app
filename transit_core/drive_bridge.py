@@ -2,15 +2,16 @@
 from __future__ import annotations
 
 from typing import Dict, Any
+import base64
 import requests
 import streamlit as st
 
 
 def _require_secrets() -> Dict[str, str]:
     drive = st.secrets.get("drive", {})
-    script_url = drive.get("script_url", "").strip()
-    token = drive.get("token", "").strip()
-    root_folder_id = drive.get("root_folder_id", "").strip()
+    script_url = (drive.get("script_url") or "").strip()
+    token = (drive.get("token") or "").strip()
+    root_folder_id = (drive.get("root_folder_id") or "").strip()
 
     missing = []
     if not script_url:
@@ -24,7 +25,7 @@ def _require_secrets() -> Dict[str, str]:
         raise RuntimeError(
             "Faltan secrets para Drive Bridge: "
             + ", ".join(missing)
-            + ". Revisa tu .streamlit/secrets.toml"
+            + ". Revisa tu .streamlit/secrets.toml / Secrets en Streamlit Cloud"
         )
 
     return {"script_url": script_url, "token": token, "root_folder_id": root_folder_id}
@@ -55,24 +56,27 @@ def upload_file_to_case_folder_via_script(
     file_bytes: bytes,
     file_name: str,
     mime_type: str,
-    subfolder: str = "",
 ) -> Dict[str, Any]:
+    """
+    ✅ Compatible con tu Apps Script:
+    - action = "upload"
+    - folder_id, file_name, mime_type, file_b64 (base64)
+    """
     s = _require_secrets()
     url = s["script_url"]
 
-    files = {
-        "file": (file_name, file_bytes, mime_type or "application/octet-stream")
-    }
-    data = {
+    file_b64 = base64.b64encode(file_bytes).decode("utf-8")
+
+    payload = {
         "token": s["token"],
-        "action": "upload_file",
-        "case_folder_id": case_folder_id,
-        "subfolder": subfolder or "",
+        "action": "upload",
+        "folder_id": case_folder_id,
         "file_name": file_name,
         "mime_type": mime_type or "application/octet-stream",
+        "file_b64": file_b64,
     }
 
-    r = requests.post(url, data=data, files=files, timeout=60)
+    r = requests.post(url, json=payload, timeout=90)
     r.raise_for_status()
     out = r.json() if r.content else {}
     if not out.get("ok"):
