@@ -28,10 +28,8 @@ def build_case_summary_pdf_bytes(
     documents_df: Optional[pd.DataFrame],
 ) -> bytes:
     """
-    Genera PDF (bytes) con el resumen del trámite en un formato tipo “aduana”.
-    - vehicles_df: items filtrados item_type == 'vehicle'
-    - articles_df: items filtrados item_type == 'article'
-    - documents_df: documentos del case
+    Genera PDF (bytes) con el resumen del trámite.
+    Nota: Este PDF es parte del proceso (no final de aduana todavía).
     """
 
     buf = BytesIO()
@@ -92,14 +90,16 @@ def build_case_summary_pdf_bytes(
     if vehicles_df is None or vehicles_df.empty:
         write("(sin vehículos)")
     else:
-        vdf = vehicles_df.copy().fillna("")
-        vdf = vdf.reset_index(drop=True)
+        vdf = vehicles_df.copy().fillna("").reset_index(drop=True)
 
         for i, row in vdf.iterrows():
             ensure_space(1.25 * inch)
             no = i + 1
 
-            vin = _safe(row.get("unique_key"))
+            # ✅ Corrección: en tu sheet existe "vin" (no "unique_key")
+            vin = _safe(row.get("vin"))
+            vehicle_id = _safe(row.get("vehicle_id"))
+
             brand = _safe(row.get("brand"))
             model = _safe(row.get("model"))
             year = _safe(row.get("year"))
@@ -107,18 +107,21 @@ def build_case_summary_pdf_bytes(
             source = _safe(row.get("source"))
             created_item = _safe(row.get("created_at"))
 
-            # campos extra si existen en tu sheet
-            trim = _safe(row.get("trim")) if "trim" in vdf.columns else ""
-            engine = _safe(row.get("engine")) if "engine" in vdf.columns else ""
-            vtype = _safe(row.get("vehicle_type")) if "vehicle_type" in vdf.columns else ""
-            body = _safe(row.get("body_class")) if "body_class" in vdf.columns else ""
-            plant = _safe(row.get("plant_country")) if "plant_country" in vdf.columns else ""
-            gvwr = _safe(row.get("gvwr")) if "gvwr" in vdf.columns else ""
-            curb = _safe(row.get("curb_weight")) if "curb_weight" in vdf.columns else ""
-            peso = _safe(row.get("weight"))  # “Peso (opcional)” texto libre
+            trim = _safe(row.get("trim"))
+            engine = _safe(row.get("engine"))
+            vtype = _safe(row.get("vehicle_type"))
+            body = _safe(row.get("body_class"))
+            plant = _safe(row.get("plant_country"))
+            gvwr = _safe(row.get("gvwr"))
+            curb = _safe(row.get("curb_weight"))
+            peso = _safe(row.get("weight"))
+            value = _safe(row.get("value"))
 
             write(f"Vehículo #{no}: VIN: {vin}", bold=True)
+            if vehicle_id:
+                write(f"ID: {vehicle_id}")
             write(f"Marca/Modelo/Año: {brand} {model} {year}")
+
             if trim:
                 write(f"Trim: {trim}")
             if engine:
@@ -135,6 +138,8 @@ def build_case_summary_pdf_bytes(
                 write(f"Curb weight: {curb}")
             if peso:
                 write(f"Peso (opcional): {peso}")
+            if value:
+                write(f"Valor (opcional): {value}")
             if desc:
                 write(f"Nota/Descripción: {desc}")
             if source:
@@ -154,23 +159,41 @@ def build_case_summary_pdf_bytes(
     if articles_df is None or articles_df.empty:
         write("(sin artículos)")
     else:
-        adf = articles_df.copy().fillna("")
-        adf = adf.reset_index(drop=True)
+        adf = articles_df.copy().fillna("").reset_index(drop=True)
 
         for i, row in adf.iterrows():
             ensure_space(1.25 * inch)
             no = i + 1
 
-            uk = _safe(row.get("unique_key"))  # A-CASE-0001
+            # ✅ Corrección: en tu sheet existe "seq" (no "unique_key")
+            seq = _safe(row.get("seq"))
+            article_id = _safe(row.get("article_id"))
+
+            item_type = _safe(row.get("item_type"))
+            ref = _safe(row.get("ref"))
             brand = _safe(row.get("brand"))
             model = _safe(row.get("model"))
             qty = _safe(row.get("quantity"))
             weight = _safe(row.get("weight"))
             value = _safe(row.get("value"))
             desc = _safe(row.get("description"))
+            condition = _safe(row.get("condition"))
+            is_part = _safe(row.get("is_vehicle_part"))
+            parent_vin = _safe(row.get("parent_vin"))
+            source = _safe(row.get("source"))
             created_item = _safe(row.get("created_at"))
 
-            write(f"Item #{no}: {uk}", bold=True)
+            title = seq or article_id or f"Item #{no}"
+            write(f"Item #{no}: {title}", bold=True)
+
+            meta = []
+            if item_type:
+                meta.append(f"Tipo: {item_type}")
+            if ref:
+                meta.append(f"Ref: {ref}")
+            if meta:
+                write(" | ".join(meta))
+
             if desc:
                 write(f"Descripción: {desc}")
             else:
@@ -181,6 +204,8 @@ def build_case_summary_pdf_bytes(
                 line.append(f"Marca: {brand}")
             if model:
                 line.append(f"Modelo: {model}")
+            if condition:
+                line.append(f"Condición: {condition}")
             if qty:
                 line.append(f"Cantidad: {qty}")
             if weight:
@@ -191,6 +216,13 @@ def build_case_summary_pdf_bytes(
             if line:
                 write(" | ".join(line))
 
+            if is_part:
+                write(f"Parte de vehículo: {is_part}")
+            if parent_vin:
+                write(f"VIN relacionado: {parent_vin}")
+
+            if source:
+                write(f"Fuente: {source}")
             if created_item:
                 write(f"Registrado: {created_item}")
 
@@ -206,8 +238,7 @@ def build_case_summary_pdf_bytes(
     if documents_df is None or documents_df.empty:
         write("(sin documentos)")
     else:
-        ddf = documents_df.copy().fillna("")
-        ddf = ddf.reset_index(drop=True)
+        ddf = documents_df.copy().fillna("").reset_index(drop=True)
 
         for i, row in ddf.iterrows():
             ensure_space(1.25 * inch)
