@@ -182,7 +182,7 @@ def _append(tab: str, row: list[Any]) -> None:
     for attempt in range(6):
         try:
             ws.append_row(row, value_input_option="USER_ENTERED")
-            _bump_rev(tab)  # invalida cache
+            _bump_rev(tab)
             return
         except gspread.exceptions.APIError as e:
             last_err = e
@@ -212,6 +212,84 @@ def get_client(client_id: str) -> dict[str, Any] | None:
         if str(r.get("client_id","")) == str(client_id):
             return r
     return None
+
+
+def search_clients(query: str) -> pd.DataFrame:
+    df = list_clients().fillna("")
+    q = (query or "").strip().lower()
+    if df.empty or not q:
+        return df
+    mask = df.apply(lambda r: q in str(r.to_dict()).lower(), axis=1)
+    return df[mask]
+
+
+def upsert_client(
+    name: str,
+    address: str = "",
+    id_type: str = "",
+    id_number: str = "",
+    phone: str = "",
+    email: str = "",
+    country_destination: str = "",
+    client_id: Optional[str] = None,
+) -> str:
+    init_db()
+    ws = _ws("clients")
+    headers = _safe_get_row1(ws)
+    now = _now_iso()
+
+    # leer registros (sin cache para update correcto)
+    records = ws.get_all_records()
+
+    if client_id:
+        # buscar row de ese client_id
+        col_client_id = headers.index("client_id") + 1 if "client_id" in headers else 1
+        col_vals = ws.col_values(col_client_id)
+        row_idx = None
+        for i, v in enumerate(col_vals, start=1):
+            if i == 1:
+                continue
+            if str(v).strip() == str(client_id).strip():
+                row_idx = i
+                break
+        if row_idx is not None:
+            # preservar created_at si existe
+            prev_created = ""
+            try:
+                prev_created = str(records[row_idx - 2].get("created_at","") or "").strip()
+            except Exception:
+                prev_created = ""
+
+            updated = {
+                "client_id": client_id,
+                "name": name,
+                "address": address,
+                "id_type": id_type,
+                "id_number": id_number,
+                "phone": phone,
+                "email": email,
+                "country_destination": country_destination,
+                "created_at": prev_created or now,
+                "updated_at": now,
+            }
+
+            # update por headers
+            end_col = _col_letter(len(headers))
+            ws.update(f"A{row_idx}:{end_col}{row_idx}", [[updated.get(h, "") for h in headers]])
+            _bump_rev("clients")
+            return client_id
+
+    # crear nuevo client_id incremental
+    max_n = 0
+    for r in records:
+        cid = str(r.get("client_id","")).strip()
+        if cid.startswith("CL-") and cid[3:].isdigit():
+            max_n = max(max_n, int(cid[3:]))
+
+    new_id = f"CL-{max_n+1:06d}"
+    row = [new_id, name, address, id_type, id_number, phone, email, country_destination, now, now]
+    _append("clients", row)
+    return new_id
 
 
 # -----------------------------
@@ -268,13 +346,12 @@ def update_case_fields(case_id: str, fields: dict) -> None:
 
     col_case_id = headers.index("case_id") + 1
 
-    # ✅ row lookup robusto
     col_vals = ws.col_values(col_case_id)  # incluye header
     target = str(case_id).strip()
     row_idx = None
     for i, v in enumerate(col_vals, start=1):
         if i == 1:
-            continue  # header
+            continue
         if str(v).strip() == target:
             row_idx = i
             break
@@ -293,7 +370,7 @@ def update_case_fields(case_id: str, fields: dict) -> None:
 
     data = [{"range": f"{_col_letter(c)}{r}", "values": [[val]]} for (r, c, val) in updates]
     ws.batch_update(data)
-    _bump_rev("cases")  # invalida cache
+    _bump_rev("cases")
 
 
 # -----------------------------
