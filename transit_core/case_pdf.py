@@ -1,115 +1,151 @@
 # transit_core/case_pdf.py
 from __future__ import annotations
 
+from typing import Dict, Any, List
 from io import BytesIO
 from datetime import datetime
-from typing import Optional
-
-import pandas as pd
 
 from reportlab.lib.pagesizes import letter
+from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
 
 
+def _safe(s: Any) -> str:
+    return ("" if s is None else str(s)).strip()
+
+
 def build_case_summary_pdf(
-    case_id: str,
+    case: Dict[str, Any],
     client_name: str,
-    client_id: str,
-    case_status: str,
-    origin: str,
-    destination: str,
-    drive_folder_id: str,
-    items_df: Optional[pd.DataFrame],
-    docs_df: Optional[pd.DataFrame],
+    vehicles: List[Dict[str, Any]],
+    articles: List[Dict[str, Any]],
+    documents: List[Dict[str, Any]],
 ) -> bytes:
     """
-    Genera un PDF simple (tipo reporte) con el resumen del trámite.
-    Retorna bytes del PDF.
+    PDF simple tipo "cabecera + datos + partidas/items" (inspirado en tu ejemplo).
     """
-    buffer = BytesIO()
-    c = canvas.Canvas(buffer, pagesize=letter)
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=letter)
     w, h = letter
 
-    left = 40
-    y = h - 45
-    line_h = 14
+    left = 0.65 * inch
+    right = w - 0.65 * inch
+    y = h - 0.75 * inch
 
-    def draw_line(text: str, bold: bool = False):
-        nonlocal y
-        if y < 60:
-            c.showPage()
-            y = h - 45
-        c.setFont("Helvetica-Bold" if bold else "Helvetica", 10)
-        c.drawString(left, y, text[:1300])
-        y -= line_h
+    case_id = _safe(case.get("case_id"))
+    status = _safe(case.get("status"))
+    origin = _safe(case.get("origin"))
+    destination = _safe(case.get("destination"))
+    created_at = _safe(case.get("created_at"))
+    updated_at = _safe(case.get("updated_at"))
 
     # Header
-    draw_line("RESUMEN DE TRÁMITE (Para revisión Aduanas)", bold=True)
-    draw_line(f"Generado: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    draw_line("")
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(left, y, "RESUMEN DEL TRÁMITE")
+    y -= 18
 
-    # Case info
-    draw_line("Datos del trámite", bold=True)
-    draw_line(f"Trámite (Case ID): {case_id}")
-    draw_line(f"Estatus: {case_status}")
-    draw_line(f"Cliente: {client_name}  |  ID: {client_id}")
-    draw_line(f"Origen: {origin}  |  Destino: {destination}")
-    draw_line(f"Drive folder_id: {drive_folder_id}")
-    draw_line("")
+    c.setFont("Helvetica", 10)
+    c.drawString(left, y, f"Trámite: {case_id}")
+    y -= 14
+    c.drawString(left, y, f"Cliente: {client_name}")
+    y -= 14
+    c.drawString(left, y, f"Origen: {origin}    Destino: {destination}    Estatus: {status}")
+    y -= 14
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    c.drawString(left, y, f"Generado: {now}    Creado: {created_at}    Actualizado: {updated_at}")
+    y -= 18
 
-    # Items
-    draw_line("Items registrados (vehículos y artículos)", bold=True)
-    if items_df is None or items_df.empty:
-        draw_line("No hay items registrados.")
+    # Divider
+    c.line(left, y, right, y)
+    y -= 18
+
+    def section(title: str):
+        nonlocal y
+        if y < 1.25 * inch:
+            c.showPage()
+            y = h - 0.75 * inch
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(left, y, title)
+        y -= 14
+        c.setFont("Helvetica", 9)
+
+    def row(label: str, value: str):
+        nonlocal y
+        if y < 1.05 * inch:
+            c.showPage()
+            y = h - 0.75 * inch
+            c.setFont("Helvetica", 9)
+        c.drawString(left, y, f"{label}: {value}")
+        y -= 12
+
+    # Vehicles
+    section("1) Vehículos")
+    if not vehicles:
+        row("-", "No hay vehículos registrados.")
     else:
-        # Intentar columnas clave si existen
-        cols_pref = [cname for cname in ["item_type", "unique_key", "brand", "model", "year", "quantity", "weight", "value", "description", "item_id"] if cname in items_df.columns]
-        if not cols_pref:
-            cols_pref = list(items_df.columns)[:10]
+        for i, v in enumerate(vehicles, start=1):
+            vin = _safe(v.get("unique_key") or v.get("vin") or "")
+            desc = _safe(v.get("description"))
+            brand = _safe(v.get("brand"))
+            model = _safe(v.get("model"))
+            year = _safe(v.get("year"))
+            trim = _safe(v.get("trim"))
+            engine = _safe(v.get("engine"))
+            vtype = _safe(v.get("vehicle_type"))
+            body = _safe(v.get("body_class"))
+            plant = _safe(v.get("plant_country"))
+            gvwr = _safe(v.get("gvwr"))
+            curb = _safe(v.get("curb_weight"))
+            weight = _safe(v.get("weight"))
 
-        # Recortar filas
-        df = items_df.copy()
-        df = df.fillna("")
-        df = df[cols_pref]
+            row(f"Vehículo #{i}", f"VIN: {vin}")
+            row("  Marca/Modelo/Año", f"{brand} {model} {year}".strip())
+            if trim: row("  Trim", trim)
+            if engine: row("  Motor", engine)
+            if vtype: row("  Tipo", vtype)
+            if body: row("  Carrocería", body)
+            if plant: row("  País planta", plant)
+            if gvwr: row("  GVWR", gvwr)
+            if curb: row("  Curb weight", curb)
+            if weight: row("  Peso (opcional)", weight)
+            if desc: row("  Nota", desc)
+            y -= 6
 
-        # Escribir filas
-        max_rows = min(len(df), 120)  # para no hacer un pdf infinito
-        for i in range(max_rows):
-            row = df.iloc[i].to_dict()
-            # linea compacta
-            parts = []
-            for k in cols_pref:
-                v = str(row.get(k, "")).strip()
-                if v:
-                    parts.append(f"{k}={v}")
-            draw_line(f"- {i+1}. " + " | ".join(parts))
-        if len(df) > max_rows:
-            draw_line(f"... ({len(df) - max_rows} filas más omitidas por tamaño)")
+    y -= 6
+    c.line(left, y, right, y)
+    y -= 14
 
-    draw_line("")
+    # Articles
+    section("2) Artículos / Items")
+    if not articles:
+        row("-", "No hay artículos registrados.")
+    else:
+        for i, a in enumerate(articles, start=1):
+            desc = _safe(a.get("description"))
+            qty = _safe(a.get("quantity"))
+            weight = _safe(a.get("weight"))
+            value = _safe(a.get("value"))
+            row(f"Item #{i}", desc or "(sin descripción)")
+            if qty: row("  Cantidad", qty)
+            if weight: row("  Peso", weight)
+            if value: row("  Valor", value)
+            y -= 6
+
+    y -= 6
+    c.line(left, y, right, y)
+    y -= 14
 
     # Documents
-    draw_line("Documentos del trámite", bold=True)
-    if docs_df is None or docs_df.empty:
-        draw_line("No hay documentos registrados.")
+    section("3) Documentos del trámite")
+    if not documents:
+        row("-", "No hay documentos subidos.")
     else:
-        df = docs_df.copy().fillna("")
-        cols_pref = [cname for cname in ["doc_id", "doc_type", "file_name", "drive_file_id", "created_at"] if cname in df.columns]
-        if not cols_pref:
-            cols_pref = list(df.columns)[:8]
-
-        max_rows = min(len(df), 200)
-        for i in range(max_rows):
-            row = df.iloc[i].to_dict()
-            parts = []
-            for k in cols_pref:
-                v = str(row.get(k, "")).strip()
-                if v:
-                    parts.append(f"{k}={v}")
-            draw_line(f"- {i+1}. " + " | ".join(parts))
-        if len(df) > max_rows:
-            draw_line(f"... ({len(df) - max_rows} filas más omitidas por tamaño)")
+        for i, d in enumerate(documents, start=1):
+            dt = _safe(d.get("doc_type"))
+            fn = _safe(d.get("file_name"))
+            row(f"Documento #{i}", f"[{dt}] {fn}".strip())
+        y -= 6
 
     c.showPage()
     c.save()
-    return buffer.getvalue()
+    return buf.getvalue()
