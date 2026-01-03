@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional, Any
+from typing import Optional, Any, Dict
 
 import pandas as pd
 import gspread
@@ -11,24 +11,31 @@ import streamlit as st
 import time
 import random
 
-from .ids import next_case_id, next_article_seq, next_item_id, next_doc_id
+from .ids import next_case_id, next_vehicle_id, next_article_id, next_doc_id
 from .validators import is_valid_vin, normalize_vin
 
 
 SHEETS = {
     "clients": ["client_id","name","address","id_type","id_number","phone","email","country_destination","created_at","updated_at"],
-    "cases": [
-        "case_id","client_id","case_date","status","origin","destination","notes",
-        "drive_folder_id","created_at","updated_at","final_pdf_drive_id","final_pdf_uploaded_at"
+    "cases": ["case_id","client_id","case_date","status","origin","destination","notes","drive_folder_id","created_at","updated_at","final_pdf_drive_id","final_pdf_uploaded_at"],
+
+    # ✅ NUEVO: VEHICLES (solo vehículos)
+    "vehicles": [
+        "vehicle_id","case_id","vin","brand","model","year",
+        "trim","engine","vehicle_type","body_class","plant_country",
+        "gvwr","curb_weight","weight","value","description","source","created_at"
     ],
-    # ✅ items: agregamos campos extra (solo vehículos los llenan)
-    "items": [
-        "item_id","case_id","item_type","unique_key",
-        "brand","model","year",
-        "trim","engine","vehicle_type","body_class","plant_country","gvwr","curb_weight",
-        "description","quantity","weight","value","source","created_at"
+
+    # ✅ NUEVO: ARTICLES (solo artículos)
+    "articles": [
+        "article_id","case_id","seq",
+        "item_type","ref","brand","model",
+        "weight","condition","quantity","value",
+        "is_vehicle_part","parent_vin",
+        "description","source","created_at"
     ],
-    "documents": ["doc_id","case_id","item_id","doc_type","drive_file_id","file_name","uploaded_at"],
+
+    "documents": ["doc_id","case_id","doc_type","drive_file_id","file_name","uploaded_at"],
     "audit_log": ["log_id","timestamp","user","action","entity","entity_id","details"],
     "oauth_tokens": ["key","value"],
 }
@@ -223,7 +230,6 @@ def upsert_client(
     now = _now_iso()
     headers = SHEETS["clients"]
 
-    # Update
     if client_id:
         for i, r in enumerate(records, start=2):
             if str(r.get("client_id","")) == client_id:
@@ -242,7 +248,6 @@ def upsert_client(
                 _update_row_by_headers(ws, i, headers, updated)
                 return client_id
 
-    # Insert
     max_n = 0
     for r in records:
         cid = str(r.get("client_id","")).strip()
@@ -299,7 +304,6 @@ def update_case_fields(case_id: str, fields: dict) -> None:
     init_db()
     ws = _ws("cases")
     headers = _safe_get_row1(ws)
-
     if "case_id" not in headers:
         raise RuntimeError("La hoja 'cases' no tiene columna case_id.")
 
@@ -323,11 +327,11 @@ def update_case_fields(case_id: str, fields: dict) -> None:
 
 
 # -----------------------------
-# ITEMS
+# VEHICLES
 # -----------------------------
-def list_items(case_id: Optional[str] = None) -> pd.DataFrame:
+def list_vehicles(case_id: Optional[str] = None) -> pd.DataFrame:
     init_db()
-    df = pd.DataFrame(_get_all_records("items"))
+    df = pd.DataFrame(_get_all_records("vehicles"))
     if df.empty:
         return df
     if case_id:
@@ -337,13 +341,13 @@ def list_items(case_id: Optional[str] = None) -> pd.DataFrame:
 
 def _vin_exists_global(vin: str) -> bool:
     v = normalize_vin(vin)
-    for r in _get_all_records("items"):
-        if str(r.get("item_type","")) == "vehicle" and normalize_vin(str(r.get("unique_key",""))) == v:
+    for r in _get_all_records("vehicles"):
+        if normalize_vin(str(r.get("vin",""))) == v:
             return True
     return False
 
 
-def add_vehicle_item(
+def add_vehicle(
     case_id: str,
     vin: str,
     brand: str = "",
@@ -356,71 +360,99 @@ def add_vehicle_item(
     plant_country: str = "",
     gvwr: str = "",
     curb_weight: str = "",
-    description: str = "",
-    quantity: int = 1,
     weight: str = "",
-    value: str = "",
-    source: str = "manual",
+    value: str = "0",
+    description: str = "",
+    source: str = "vin_text",
 ) -> str:
     init_db()
     v = normalize_vin(vin)
-    if not is_valid_vin(v):
+    if not is_valid_vin(v) or len(v) != 17:
         raise ValueError("VIN inválido. Debe tener 17 caracteres y no incluir I/O/Q.")
     if _vin_exists_global(v):
         raise ValueError("Este VIN ya existe en el sistema (no se puede duplicar).")
 
-    items_ws = _ws("items")
-    existing_item_ids = [r.get("item_id","") for r in items_ws.get_all_records()]
-    item_id = next_item_id(existing_item_ids)
+    ws = _ws("vehicles")
+    records = ws.get_all_records()
+    existing_ids = [r.get("vehicle_id","") for r in records]
+    vehicle_id = next_vehicle_id(existing_ids)
     now = _now_iso()
 
     row = [
-        item_id, case_id, "vehicle", v,
-        brand, model, year,
-        trim, engine, vehicle_type, body_class, plant_country, gvwr, curb_weight,
-        description,
-        int(quantity or 1),
-        weight, value, source, now
+        vehicle_id, case_id, v, brand, model, year,
+        trim, engine, vehicle_type, body_class, plant_country,
+        gvwr, curb_weight, weight, value, description, source, now
     ]
-    _append("items", row)
-    return item_id
-
-
-def add_article_item(
-    case_id: str,
-    description: str,
-    brand: str = "",
-    model: str = "",
-    quantity: int = 1,
-    weight: str = "",
-    value: str = "",
-    source: str = "manual",
-) -> str:
-    init_db()
-    items_ws = _ws("items")
-    records = items_ws.get_all_records()
-    existing_item_ids = [r.get("item_id","") for r in records]
-    existing_keys = [r.get("unique_key","") for r in records if str(r.get("case_id","")) == case_id]
-
-    item_id = next_item_id(existing_item_ids)
-    seq = next_article_seq(existing_keys, case_id=case_id)
-    now = _now_iso()
-
-    # artículos NO llenan campos extra (trim/engine/etc)
-    row = [
-        item_id, case_id, "article", seq,
-        brand, model, "",  # year vacío
-        "", "", "", "", "", "", "",  # extras vacíos
-        description,
-        int(quantity or 1),
-        weight, value, source, now
-    ]
-    _append("items", row)
-    return item_id
+    _append("vehicles", row)
+    return vehicle_id
 
 
 # -----------------------------
-# DOCUMENTS (a nivel CASE)
+# ARTICLES
+# -----------------------------
+def list_articles(case_id: Optional[str] = None) -> pd.DataFrame:
+    init_db()
+    df = pd.DataFrame(_get_all_records("articles"))
+    if df.empty:
+        return df
+    if case_id:
+        return df[df["case_id"] == case_id]
+    return df
+
+
+def _next_seq_for_case(case_id: str) -> str:
+    ws = _ws("articles")
+    records = ws.get_all_records()
+    seqs = [r.get("seq","") for r in records if str(r.get("case_id","")) == case_id]
+    # seq = A-<CASE_ID>-0001
+    mx = 0
+    for s in seqs:
+        s = str(s).strip()
+        if s.startswith(f"A-{case_id}-"):
+            try:
+                mx = max(mx, int(s.split("-")[-1]))
+            except Exception:
+                pass
+    return f"A-{case_id}-{mx+1:04d}"
+
+
+def add_article(
+    case_id: str,
+    item_type: str,
+    ref: str = "",
+    brand: str = "",
+    model: str = "",
+    weight: str = "",
+    condition: str = "",
+    quantity: int = 1,
+    value: str = "",
+    is_vehicle_part: bool = False,
+    parent_vin: str = "",
+    description: str = "",
+    source: str = "voice",
+) -> str:
+    init_db()
+    ws = _ws("articles")
+    records = ws.get_all_records()
+    existing_ids = [r.get("article_id","") for r in records]
+    article_id = next_article_id(existing_ids)
+    seq = _next_seq_for_case(case_id)
+    now = _now_iso()
+
+    pv = normalize_vin(parent_vin) if is_vehicle_part else ""
+    row = [
+        article_id, case_id, seq,
+        (item_type or "").strip(), (ref or "").strip(), (brand or "").strip(), (model or "").strip(),
+        (weight or "").strip(), (condition or "").strip(), int(quantity or 1), (value or "").strip(),
+        "SI" if is_vehicle_part else "NO", pv,
+        (description or "").strip(), source, now
+    ]
+    _append("articles", row)
+    return article_id
+
+
+# -----------------------------
+# DOCUMENTS (a nivel trámite)
 # -----------------------------
 def list_documents(case_id: str) -> pd.DataFrame:
     init_db()
@@ -435,13 +467,12 @@ def add_document(
     drive_file_id: str,
     file_name: str,
     doc_type: str,
-    item_id: str = "",
 ) -> str:
     init_db()
-    docs_ws = _ws("documents")
-    existing_doc_ids = [r.get("doc_id","") for r in docs_ws.get_all_records()]
+    ws = _ws("documents")
+    existing_doc_ids = [r.get("doc_id","") for r in ws.get_all_records()]
     doc_id = next_doc_id(existing_doc_ids)
     now = _now_iso()
-    row = [doc_id, case_id, item_id, doc_type, drive_file_id, file_name, now]
+    row = [doc_id, case_id, doc_type, drive_file_id, file_name, now]
     _append("documents", row)
     return doc_id
