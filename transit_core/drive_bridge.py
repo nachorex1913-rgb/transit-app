@@ -1,7 +1,7 @@
 # transit_core/drive_bridge.py
 from __future__ import annotations
 
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 import requests
 import streamlit as st
 
@@ -60,8 +60,6 @@ def upload_file_to_case_folder_via_script(
     s = _require_secrets()
     url = s["script_url"]
 
-    # Apps Script suele recibir base64; aquí lo mandamos como bytes via multipart
-    # Si tu Apps Script espera base64, avísame y te lo ajusto al formato exacto.
     files = {
         "file": (file_name, file_bytes, mime_type or "application/octet-stream")
     }
