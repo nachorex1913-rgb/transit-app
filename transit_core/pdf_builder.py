@@ -173,57 +173,36 @@ def build_case_summary_pdf_bytes(
 
     hr()
 
-    # -------------------------
-    # 2) Artículos / Items  (NO TOCAR)
-    # -------------------------
-    write("2) Artículos / Items", bold=True, size=12, extra_space=2)
+# ==========================
+# 2) Artículos / Items
+# ==========================
+y = _section_title(c, "2) Artículos / Items", y)
 
-    if articles_df is None or articles_df.empty:
-        write("(sin artículos)")
-    else:
-        adf = articles_df.copy().fillna("")
-        adf = adf.reset_index(drop=True)
+items = []
+if articles_df is not None:
+    items = articles_df.fillna("").to_dict("records")
 
-        for i, row in adf.iterrows():
-            ensure_space(1.25 * inch)
-            no = i + 1
+for i, row in enumerate(items, start=1):
+    desc = str(row.get("description", "") or "").strip()
 
-            uk = _safe(row.get("unique_key"))
-            brand = _safe(row.get("brand"))
-            model = _safe(row.get("model"))
-            qty = _safe(row.get("quantity"))
-            weight = _safe(row.get("weight"))
-            value = _safe(row.get("value"))
-            desc = _safe(row.get("description"))
-            created_item = _safe(row.get("created_at"))
+    # ✅ SOLO DESCRIPCIÓN (NO repetir campos)
+    y = _line(c, f"Artículo #{i}:", x_left, y, bold=True)
 
-            write(f"Item #{no}: {uk}", bold=True)
-            if desc:
-                write(f"Descripción: {desc}")
-            else:
-                write("Descripción: (sin descripción)")
+    # wrap para no salirse del margen
+    y = _wrap_paragraph(
+        c,
+        f"Descripción: {desc}",
+        x_left,
+        y,
+        max_width=usable_width,
+        leading=12
+    )
 
-            line = []
-            if brand:
-                line.append(f"Marca: {brand}")
-            if model:
-                line.append(f"Modelo: {model}")
-            if qty:
-                line.append(f"Cantidad: {qty}")
-            if weight:
-                line.append(f"Peso: {weight}")
-            if value:
-                line.append(f"Valor: {value}")
+    created = str(row.get("created_at", "") or row.get("registered_at", "") or "").strip()
+    if created:
+        y = _line(c, f"Registrado: {created}", x_left, y)
 
-            if line:
-                write(" | ".join(line))
-
-            if created_item:
-                write(f"Registrado: {created_item}")
-
-            y -= 4
-
-    hr()
+    y -= 6
 
     # -------------------------
     # 3) Documentos del trámite  ✅ (CAMBIO AQUÍ)
