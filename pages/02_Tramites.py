@@ -8,7 +8,6 @@ from datetime import datetime
 from transit_core.gsheets_db import (
     list_clients,
     list_cases,
-    get_case,
     create_case,
     update_case_fields,
     list_items,
@@ -24,6 +23,7 @@ from transit_core.drive_bridge import (
 from transit_core.ids import next_case_id
 from transit_core.validators import normalize_vin, is_valid_vin
 from transit_core.vin_decode import decode_vin
+from transit_core.case_pdf import build_case_summary_pdf
 
 
 st.set_page_config(page_title="Trámites", layout="wide")
@@ -46,7 +46,6 @@ def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 def _try_toast(msg: str, icon: str = "✅"):
-    # streamlit >= 1.27 tiene st.toast
     try:
         st.toast(msg, icon=icon)  # type: ignore[attr-defined]
     except Exception:
@@ -74,13 +73,6 @@ def _case_label(case_row: dict, clients_df) -> str:
 # Artículos: dictado + descripción automática
 # ----------------------------
 def _parse_article_dictation(text: str) -> dict:
-    """
-    Dictado continuo recomendado (sin ':'):
-    tipo lavadora ref 440827 marca Sienna modelo Sleep4415 peso 95 lb estado usado cantidad 1 valor 120 parte_vehiculo no
-
-    También soporta con ":" por bloques:
-    tipo: lavadora | ref: 440827 | marca: Sienna | ...
-    """
     t = _norm_spaces(text)
     data = {
         "type": "",
@@ -157,7 +149,6 @@ def _parse_article_dictation(text: str) -> dict:
             except Exception:
                 data["quantity"] = 1
         elif current_key == "is_vehicle_part":
-            # si/no
             vv = val.lower().strip()
             data["is_vehicle_part"] = vv in ("si", "sí", "yes", "true", "1")
         elif current_key == "parent_vin":
@@ -223,9 +214,6 @@ def _build_article_description(
 
 
 def _build_vehicle_description_extras(decoded: dict) -> str:
-    """
-    Empaqueta campos extra del decoder para no romper DB (los guardamos en description).
-    """
     if not decoded:
         return ""
     pairs = []
@@ -305,8 +293,9 @@ with tab_create:
                     drive_folder_id=drive_folder_id,
                 )
 
-            st.success(f"✅ Trámite creado: {created_case_id}")
-            _try_toast(f"Trámite creado: {created_case_id}")
+            msg = f"✅ Trámite creado: {created_case_id}"
+            st.success(msg)
+            _try_toast(msg)
             st.info(f"Carpeta Drive: {folder_name}")
             st.rerun()
 
@@ -345,10 +334,8 @@ with tab_list:
 with tab_manage:
     st.subheader("Gestionar trámite")
 
-    # Mensaje persistente de última acción
     if st.session_state.get("last_action_msg", ""):
         st.success(st.session_state["last_action_msg"])
-        # opcional: limpiar después de mostrar una vez
         st.session_state["last_action_msg"] = ""
 
     clients_df = list_clients().fillna("")
@@ -389,6 +376,8 @@ with tab_manage:
     case_status = str(case.get("status",""))
     drive_folder_id = str(case.get("drive_folder_id",""))
     client_id = str(case.get("client_id",""))
+    origin = str(case.get("origin","") or "")
+    destination = str(case.get("destination","") or "")
 
     client_name = ""
     if not clients_df.empty:
@@ -399,18 +388,16 @@ with tab_manage:
     st.write(f"**Trámite:** {case_id}  |  **Cliente:** {client_name}  |  **Estatus:** {case_status}")
     st.write(f"**Drive folder_id:** {drive_folder_id}")
 
-    # Cargar items/docs una vez (para resumen y validación)
     items_df = list_items(case_id=case_id)
     if items_df is not None and not items_df.empty:
-        items_df = items_df.fillna("")
-        items_df = items_df.copy().reset_index(drop=True)
+        items_df = items_df.fillna("").copy().reset_index(drop=True)
         items_df.insert(0, "No.", range(1, len(items_df) + 1))
     docs_df = list_documents(case_id)
 
     st.divider()
 
     # ---------------------------
-    # Acordeón: Agregar vehículo
+    # VEHÍCULO
     # ---------------------------
     with st.expander("🚗 Agregar vehículo", expanded=True):
         st.caption("Dicta el VIN claramente, o pégalo en el campo.")
@@ -444,11 +431,10 @@ with tab_manage:
                 key=f"consult_vin_{case_id}_{veh_nonce}"
             )
 
-        # Campos de vehículo (con nonce para reset limpio)
         veh_brand_key = f"veh_brand_{case_id}_{veh_nonce}"
         veh_model_key = f"veh_model_{case_id}_{veh_nonce}"
         veh_year_key = f"veh_year_{case_id}_{veh_nonce}"
-        veh_weight_key = f"veh_weight_{case_id}_{veh_nonce}"  # PESO (opcional) - único campo
+        veh_weight_key = f"veh_weight_{case_id}_{veh_nonce}"  # solo uno
         veh_desc_key = f"veh_desc_{case_id}_{veh_nonce}"
 
         st.session_state.setdefault(veh_brand_key, "")
@@ -469,7 +455,6 @@ with tab_manage:
                 st.session_state[veh_model_key] = str(out.get("model","") or "")
                 st.session_state[veh_year_key] = str(out.get("year","") or "")
 
-                # Prefill peso opcional con GVWR si viene y si el campo está vacío
                 gvwr = str(out.get("gvwr","") or "").strip()
                 if gvwr and not str(st.session_state.get(veh_weight_key, "") or "").strip():
                     st.session_state[veh_weight_key] = gvwr
@@ -490,10 +475,8 @@ with tab_manage:
         with vc3:
             year = st.text_input("Año", key=veh_year_key)
 
-        # ✅ SOLO 1 campo de peso
         weight_opt = st.text_input("Peso (opcional)", key=veh_weight_key)
 
-        # Referencias extra visibles (solo lectura)
         if decoded:
             extras = _build_vehicle_description_extras(decoded)
             if extras:
@@ -515,14 +498,10 @@ with tab_manage:
                 if not is_valid_vin(vin_norm):
                     raise ValueError("VIN inválido. Debe tener 17 caracteres y NO incluir I/O/Q.")
 
-                # Guardar extras del decoder dentro de description (para no romper DB)
                 extras_txt = _build_vehicle_description_extras(decoded)
                 desc_final = _safe(description)
                 if extras_txt:
-                    if desc_final:
-                        desc_final = f"{desc_final} | {extras_txt}"
-                    else:
-                        desc_final = extras_txt
+                    desc_final = f"{desc_final} | {extras_txt}".strip(" |")
 
                 with st.spinner("Guardando vehículo..."):
                     add_vehicle_item(
@@ -543,7 +522,6 @@ with tab_manage:
                 _try_toast(msg)
                 st.session_state["last_action_msg"] = msg
 
-                # Reset limpio: subir nonce
                 st.session_state[veh_nonce_key] = veh_nonce + 1
                 st.rerun()
 
@@ -553,7 +531,7 @@ with tab_manage:
     st.divider()
 
     # ---------------------------
-    # Acordeón: Agregar artículos
+    # ARTÍCULOS
     # ---------------------------
     with st.expander("📦 Agregar artículos", expanded=False):
         st.caption("Dicta en formato continuo. Ejemplo:")
@@ -564,7 +542,6 @@ with tab_manage:
         art_nonce = int(st.session_state[art_nonce_key])
 
         art_dict_key = f"art_dict_{case_id}_{art_nonce}"
-        apply_dict_key = f"apply_dict_{case_id}_{art_nonce}"
 
         art_type_key = f"art_type_{case_id}_{art_nonce}"
         art_ref_key = f"art_ref_{case_id}_{art_nonce}"
@@ -576,6 +553,7 @@ with tab_manage:
         art_value_key = f"art_value_{case_id}_{art_nonce}"
         art_is_part_key = f"art_is_part_{case_id}_{art_nonce}"
         art_parent_vin_key = f"art_parent_vin_{case_id}_{art_nonce}"
+        art_desc_preview_key = f"art_desc_preview_{case_id}_{art_nonce}"  # <-- CLAVE
 
         st.session_state.setdefault(art_dict_key, "")
         st.session_state.setdefault(art_type_key, "")
@@ -588,13 +566,14 @@ with tab_manage:
         st.session_state.setdefault(art_value_key, "")
         st.session_state.setdefault(art_is_part_key, False)
         st.session_state.setdefault(art_parent_vin_key, "")
+        st.session_state.setdefault(art_desc_preview_key, "")  # <-- CLAVE
 
         dictation = st.text_area("Dictado", height=90, key=art_dict_key)
         parsed = _parse_article_dictation(dictation)
 
         col1, col2 = st.columns([1, 3])
         with col1:
-            if st.button("Aplicar dictado", key=apply_dict_key):
+            if st.button("Aplicar dictado", key=f"apply_dict_{case_id}_{art_nonce}"):
                 st.session_state[art_type_key] = parsed.get("type","") or ""
                 st.session_state[art_ref_key] = parsed.get("ref","") or ""
                 st.session_state[art_brand_key] = parsed.get("brand","") or ""
@@ -651,6 +630,7 @@ with tab_manage:
         else:
             parent_vin = ""
 
+        # ✅ CALCULAR DESCRIPCIÓN Y METERLA EN SESSION_STATE ANTES DE MOSTRARLA
         desc_preview = _build_article_description(
             item_type=art_type,
             ref=art_ref,
@@ -663,7 +643,14 @@ with tab_manage:
             is_part=bool(is_part),
             parent_vin=parent_vin,
         )
-        st.text_area("Descripción (automática)", value=desc_preview, height=70, disabled=True, key=f"art_desc_preview_{case_id}_{art_nonce}")
+        st.session_state[art_desc_preview_key] = desc_preview
+
+        st.text_area(
+            "Descripción (automática)",
+            key=art_desc_preview_key,
+            height=70,
+            disabled=True,
+        )
 
         confirm_article = st.checkbox(
             "✅ Confirmo que la información del artículo es correcta antes de guardar.",
@@ -676,7 +663,7 @@ with tab_manage:
                 with st.spinner("Guardando artículo..."):
                     add_article_item(
                         case_id=case_id,
-                        description=desc_preview,
+                        description=st.session_state[art_desc_preview_key],
                         brand=art_brand,
                         model=art_model,
                         quantity=int(art_qty),
@@ -699,7 +686,7 @@ with tab_manage:
     st.divider()
 
     # ---------------------------
-    # Acordeón: Documentos del trámite
+    # DOCUMENTOS DEL TRÁMITE
     # ---------------------------
     with st.expander("📎 Documentos del trámite (subir TODO aquí)", expanded=False):
         if not drive_folder_id:
@@ -766,7 +753,7 @@ with tab_manage:
     st.divider()
 
     # ---------------------------
-    # Acordeón: Resumen completo del trámite
+    # RESUMEN
     # ---------------------------
     with st.expander("📌 Resumen del trámite (todo en un solo lugar)", expanded=True):
         st.write(f"**Trámite:** {case_id}")
@@ -793,11 +780,9 @@ with tab_manage:
     st.divider()
 
     # ---------------------------
-    # VALIDACIÓN -> cambia a Pendiente
+    # VALIDACIÓN + PDF + PENDIENTE
     # ---------------------------
-    st.subheader("✅ Validación del trámite")
-
-    st.caption("Cuando todo esté completo (items + documentos), marca y guarda para pasar a Pendiente.")
+    st.subheader("✅ Validación del trámite + PDF")
 
     has_items = items_df is not None and not items_df.empty
     docs_df2 = list_documents(case_id)
@@ -808,15 +793,62 @@ with tab_manage:
 
     ready = st.checkbox("Confirmo que el trámite está completo y listo para enviar", value=False, key=f"case_ready_{case_id}")
 
-    can_set_pending = ready and has_items and has_docs
-    if st.button("Marcar como PENDIENTE", disabled=not can_set_pending, type="primary", key=f"set_pending_{case_id}"):
+    can_finish = ready and has_items and has_docs and bool(drive_folder_id)
+
+    if st.button("Marcar como PENDIENTE + Generar PDF", disabled=not can_finish, type="primary", key=f"set_pending_pdf_{case_id}"):
         try:
-            with st.spinner("Actualizando estatus..."):
+            with st.spinner("Generando PDF del trámite..."):
+                # refrescar data por seguridad
+                items_latest = list_items(case_id=case_id)
+                if items_latest is not None and not items_latest.empty:
+                    items_latest = items_latest.fillna("").copy()
+                docs_latest = list_documents(case_id)
+                if docs_latest is not None and not docs_latest.empty:
+                    docs_latest = docs_latest.fillna("").copy()
+
+                pdf_bytes = build_case_summary_pdf(
+                    case_id=case_id,
+                    client_name=client_name,
+                    client_id=client_id,
+                    case_status=case_status,
+                    origin=origin,
+                    destination=destination,
+                    drive_folder_id=drive_folder_id,
+                    items_df=items_latest,
+                    docs_df=docs_latest,
+                )
+
+            pdf_name = f"{case_id}_RESUMEN_TRAMITE.pdf"
+
+            with st.spinner("Subiendo PDF a Drive..."):
+                up = upload_file_to_case_folder_via_script(
+                    case_folder_id=drive_folder_id,
+                    file_bytes=pdf_bytes,
+                    file_name=pdf_name,
+                    mime_type="application/pdf",
+                )
+                pdf_file_id = up.get("file_id", "")
+
+            with st.spinner("Registrando PDF y marcando estatus PENDIENTE..."):
+                # registrar en docs (doc_type OTRO)
+                add_document(
+                    case_id=case_id,
+                    drive_file_id=pdf_file_id,
+                    file_name=pdf_name,
+                    doc_type="OTRO",
+                    item_id="",
+                )
                 update_case_fields(case_id, {"status": "Pendiente", "updated_at": _now_iso()})
-            msg = "✅ Trámite marcado como Pendiente."
+
+            msg = "✅ Trámite marcado como Pendiente y PDF generado/subido."
             st.success(msg)
             _try_toast(msg)
             st.session_state["last_action_msg"] = msg
+
+            if pdf_file_id:
+                st.info(f"PDF en Drive: {_drive_file_url(pdf_file_id)}")
+
             st.rerun()
+
         except Exception as e:
-            st.error(f"Error actualizando estatus: {type(e).__name__}: {e}")
+            st.error(f"Error en validación/PDF: {type(e).__name__}: {e}")
