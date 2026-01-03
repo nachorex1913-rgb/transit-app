@@ -473,7 +473,6 @@ with tab_manage:
         vshow = vehicles_df.copy().reset_index(drop=True)
         vshow.insert(0, "#", range(1, len(vshow) + 1))
 
-        # Vista ejecutiva
         cols = [c for c in ["#", "vin", "brand", "model", "year"] if c in vshow.columns]
         if cols:
             vshow2 = vshow[cols].copy()
@@ -483,7 +482,7 @@ with tab_manage:
         else:
             st.dataframe(vshow, use_container_width=True)
 
-    # Artículos tabla (NO repetir campos; manda “description”)
+    # Artículos tabla
     if articles_df.empty:
         st.info("Aún no hay artículos.")
     else:
@@ -507,17 +506,14 @@ with tab_manage:
         else:
             st.dataframe(ashow, use_container_width=True)
 
-    # Documentos tabla (MOSTRAR TIPO, NO link)
+    # Documentos tabla
     if docs_df.empty:
         st.info("Aún no hay documentos.")
     else:
         dshow = docs_df.copy().reset_index(drop=True)
         dshow.insert(0, "#", range(1, len(dshow) + 1))
-
-        # Normalizamos tipo
         dshow["doc_type_clean"] = dshow.apply(lambda r: _doc_type_from_row(r.to_dict()), axis=1)
 
-        # Mostramos columnas ejecutivas
         out_cols = ["#", "doc_type_clean"]
         if "file_name" in dshow.columns:
             out_cols.append("file_name")
@@ -551,6 +547,28 @@ with tab_manage:
         st.session_state.setdefault(vin_text_key, "")
         st.session_state.setdefault(vin_decoded_key, {})
 
+        # ✅ KEYS de los campos (lo que realmente llena los inputs)
+        k_brand = f"veh_brand_{case_id}"
+        k_model = f"veh_model_{case_id}"
+        k_year = f"veh_year_{case_id}"
+        k_trim = f"veh_trim_{case_id}"
+        k_engine = f"veh_engine_{case_id}"
+        k_vtype = f"veh_vtype_{case_id}"
+        k_body = f"veh_body_{case_id}"
+        k_plant = f"veh_plant_{case_id}"
+        k_gvwr = f"veh_gvwr_{case_id}"
+
+        # Asegurar defaults para evitar KeyError
+        st.session_state.setdefault(k_brand, "")
+        st.session_state.setdefault(k_model, "")
+        st.session_state.setdefault(k_year, "")
+        st.session_state.setdefault(k_trim, "")
+        st.session_state.setdefault(k_engine, "")
+        st.session_state.setdefault(k_vtype, "")
+        st.session_state.setdefault(k_body, "")
+        st.session_state.setdefault(k_plant, "")
+        st.session_state.setdefault(k_gvwr, "")
+
         vin_text = st.text_input("VIN", key=vin_text_key)
         vin_norm = normalize_vin(vin_text)
 
@@ -570,36 +588,51 @@ with tab_manage:
                 st.warning(out["error"])
                 st.session_state[vin_decoded_key] = {}
             else:
+                # ✅ Guardamos decoded para debug
                 st.session_state[vin_decoded_key] = out
-                st.success("✅ Info consultada. Revisa antes de guardar.")
+
+                # ✅ ESTE ES EL FIX: llenar los campos reales (session_state de los inputs)
+                st.session_state[k_brand] = str(out.get("brand", "") or "").strip()
+                st.session_state[k_model] = str(out.get("model", "") or "").strip()
+                st.session_state[k_year] = str(out.get("year", "") or "").strip()
+                st.session_state[k_trim] = str(out.get("trim", "") or "").strip()
+                st.session_state[k_engine] = str(out.get("engine", "") or "").strip()
+                st.session_state[k_vtype] = str(out.get("vehicle_type", "") or "").strip()
+                st.session_state[k_body] = str(out.get("body_class", "") or "").strip()
+                st.session_state[k_plant] = str(out.get("plant_country", "") or "").strip()
+                st.session_state[k_gvwr] = str(out.get("gvwr", "") or "").strip()
+
+                st.success("✅ Info consultada y aplicada a los campos. Revisa antes de guardar.")
+                st.rerun()
 
         decoded = st.session_state.get(vin_decoded_key, {}) or {}
         with st.expander("🧪 Debug decoder", expanded=False):
             st.json(decoded)
 
+        # ✅ YA NO usamos value=decoded... porque eso NO rellena widgets ya creados.
         c1, c2, c3 = st.columns(3)
         with c1:
-            brand = st.text_input("Marca", value=str(decoded.get("brand", "") or ""), key=f"veh_brand_{case_id}")
+            brand = st.text_input("Marca", key=k_brand)
         with c2:
-            model = st.text_input("Modelo", value=str(decoded.get("model", "") or ""), key=f"veh_model_{case_id}")
+            model = st.text_input("Modelo", key=k_model)
         with c3:
-            year = st.text_input("Año", value=str(decoded.get("year", "") or ""), key=f"veh_year_{case_id}")
+            year = st.text_input("Año", key=k_year)
 
         c4, c5, c6 = st.columns(3)
         with c4:
-            trim = st.text_input("Trim (opcional)", value=str(decoded.get("trim", "") or ""), key=f"veh_trim_{case_id}")
+            trim = st.text_input("Trim (opcional)", key=k_trim)
         with c5:
-            engine = st.text_input("Engine (opcional)", value=str(decoded.get("engine", "") or ""), key=f"veh_engine_{case_id}")
+            engine = st.text_input("Engine (opcional)", key=k_engine)
         with c6:
-            vehicle_type = st.text_input("Vehicle type (opcional)", value=str(decoded.get("vehicle_type", "") or ""), key=f"veh_vtype_{case_id}")
+            vehicle_type = st.text_input("Vehicle type (opcional)", key=k_vtype)
 
         c7, c8, c9 = st.columns(3)
         with c7:
-            body_class = st.text_input("Body class (opcional)", value=str(decoded.get("body_class", "") or ""), key=f"veh_body_{case_id}")
+            body_class = st.text_input("Body class (opcional)", key=k_body)
         with c8:
-            plant_country = st.text_input("Plant country (opcional)", value=str(decoded.get("plant_country", "") or ""), key=f"veh_plant_{case_id}")
+            plant_country = st.text_input("Plant country (opcional)", key=k_plant)
         with c9:
-            gvwr = st.text_input("GVWR (opcional)", value=str(decoded.get("gvwr", "") or ""), key=f"veh_gvwr_{case_id}")
+            gvwr = st.text_input("GVWR (opcional)", key=k_gvwr)
 
         # ✅ Quitado Curb weight (como acordaron)
         weight_opt = st.text_input("Peso (opcional)", value="", key=f"veh_weight_{case_id}")
@@ -646,6 +679,7 @@ with tab_manage:
             vshow.insert(0, "No.", range(1, len(vshow) + 1))
             st.dataframe(vshow, use_container_width=True)
 
+    # --------- resto del archivo SIN CAMBIOS ----------
     with st.expander("📦 Artículos (agregar / ver)", expanded=True):
         st.caption("Dicta en formato continuo. Ejemplo:")
         st.code("tipo lavadora ref 440827 marca Sienna modelo Sleep4415 peso 95 lb estado usado cantidad 1 valor 120 parte_vehiculo no", language="text")
@@ -653,7 +687,6 @@ with tab_manage:
         dict_key = f"art_dict_{case_id}"
         clear_art_flag = f"__clear_art_{case_id}"
 
-        # Limpieza segura (ANTES de widgets)
         if st.session_state.get(clear_art_flag, False):
             st.session_state[dict_key] = ""
             st.session_state[f"at_{case_id}"] = ""
@@ -730,7 +763,6 @@ with tab_manage:
         }
         desc_preview = _build_article_description(d)
 
-        # ✅ Ahora SIEMPRE se actualiza en vivo (sin key fija)
         st.text_area("Descripción (automática)", value=desc_preview, height=80, disabled=True)
 
         ok = st.checkbox("✅ Confirmo que el artículo está correcto antes de guardar", key=f"art_ok_{case_id}")
@@ -816,7 +848,6 @@ with tab_manage:
                 dshow = ddf.copy().reset_index(drop=True)
                 dshow.insert(0, "No.", range(1, len(dshow) + 1))
 
-                # Mostramos Tipo correcto (no link)
                 dshow["Tipo"] = dshow.apply(lambda r: _doc_type_from_row(r.to_dict()), axis=1)
 
                 cols = ["No.", "Tipo"]
@@ -864,7 +895,6 @@ with tab_manage:
                     mime_type="application/pdf",
                 )
 
-                # registrar como documento tipo OTRO
                 add_document(
                     case_id=case_id,
                     drive_file_id=up.get("file_id", ""),
