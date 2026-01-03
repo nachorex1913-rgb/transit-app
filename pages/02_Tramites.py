@@ -9,31 +9,76 @@ from transit_core.gsheets_db import (
     create_case,
     update_case_fields,
     list_items,
-    list_documents,
     add_vehicle_item,
     add_article_item,
-    add_document,
+    list_documents,
 )
-from transit_core.drive_bridge import (
-    create_case_folder_via_script,
-    upload_file_to_case_folder_via_script,
-)
+from transit_core.drive_bridge import create_case_folder_via_script
 from transit_core.validators import normalize_vin, is_valid_vin
 from transit_core.vin_decode import decode_vin
+from transit_core.ids import next_article_seq
 
 st.set_page_config(page_title="Trámites", layout="wide")
 st.title("Trámites")
 
+OFFICE_EDIT_CODE = "778899"
 
-def _extract_vin_candidates(text: str) -> list[str]:
-    if not text:
-        return []
-    up = re.sub(r"[^A-Z0-9]", "", text.upper())
-    cands = re.findall(r"[A-HJ-NPR-Z0-9]{17}", up)
-    return list(dict.fromkeys(cands))
+
+# ---------------------------
+# Helpers
+# ---------------------------
+def _now_year() -> int:
+    return datetime.now().year
+
+
+def _client_map():
+    cdf = list_clients().fillna("")
+    mp = {}
+    if not cdf.empty and "client_id" in cdf.columns:
+        for _, r in cdf.iterrows():
+            mp[str(r.get("client_id",""))] = str(r.get("name","")).strip()
+    return mp
+
+
+def _safe_str(x) -> str:
+    return "" if x is None else str(x)
+
+
+def _auto_article_desc(
+    art_type: str,
+    ref: str,
+    brand: str,
+    model: str,
+    weight: str,
+    condition: str,
+    quantity: int,
+    value: str,
+) -> str:
+    parts = []
+    if art_type.strip():
+        parts.append(art_type.strip())
+    if ref.strip():
+        parts.append(f"Ref: {ref.strip()}")
+    if brand.strip():
+        parts.append(f"Marca: {brand.strip()}")
+    if model.strip():
+        parts.append(f"Modelo: {model.strip()}")
+    if weight.strip():
+        parts.append(f"Peso: {weight.strip()}")
+    if condition.strip():
+        parts.append(f"Estado: {condition.strip()}")
+    if quantity:
+        parts.append(f"Cantidad: {int(quantity)}")
+    if value.strip():
+        parts.append(f"Valor: {value.strip()}")
+    return " | ".join(parts).strip()
 
 
 def _parse_article_dictation(text: str) -> dict:
+    """
+    Soporta continuo, sin ":":
+    tipo lavadora ref 440827 marca Sienna modelo Sleep4415 peso 95 lb estado usado cantidad 1 valor 120 parte_vehiculo no
+    """
     t = (text or "").strip()
     data = {
         "type": "",
@@ -44,76 +89,63 @@ def _parse_article_dictation(text: str) -> dict:
         "condition": "",
         "quantity": 1,
         "is_vehicle_part": False,
-        "parent_vin": "",
         "value": "",
     }
     if not t:
         return data
 
-    parts = [p.strip() for p in re.split(r"\||\n|;", t) if p.strip()]
-    has_colon = any(":" in p for p in parts)
-
     aliases = {
-        "tipo": "type", "articulo": "type", "artículo": "type", "item": "type", "producto": "type",
+        "tipo": "type",
         "ref": "ref", "referencia": "ref", "serie": "ref", "serial": "ref",
         "marca": "brand", "brand": "brand",
         "modelo": "model", "model": "model",
-        "peso": "weight", "weight": "weight",
-        "estado": "condition", "condition": "condition",
+        "peso": "weight", "weight": "weight", "kilo": "weight", "kilos": "weight", "kg": "weight", "kilogramos": "weight", "lb": "weight", "libras": "weight",
+        "estado": "condition", "condicion": "condition", "condition": "condition",
         "cantidad": "quantity", "qty": "quantity", "quantity": "quantity",
-        "parte_vehiculo": "is_vehicle_part", "partevehiculo": "is_vehicle_part", "vehicle_part": "is_vehicle_part",
-        "vin": "parent_vin", "vin_padre": "parent_vin", "parent_vin": "parent_vin",
         "valor": "value", "value": "value",
+        "parte_vehiculo": "is_vehicle_part", "partevehiculo": "is_vehicle_part", "parte": "is_vehicle_part",
     }
 
-    def _set(key: str, val: str):
-        val = (val or "").strip()
-        if key == "quantity":
+    tokens = re.split(r"\s+", t)
+    i = 0
+    cur = None
+    buff = []
+
+    def flush():
+        nonlocal cur, buff
+        if not cur:
+            buff = []
+            return
+        val = " ".join(buff).strip()
+        if cur == "type":
+            data["type"] = val
+        elif cur == "ref":
+            data["ref"] = val
+        elif cur == "brand":
+            data["brand"] = val
+        elif cur == "model":
+            data["model"] = val
+        elif cur == "weight":
+            data["weight"] = val
+        elif cur == "condition":
+            data["condition"] = val
+        elif cur == "quantity":
             try:
                 data["quantity"] = int(re.findall(r"\d+", val)[0])
             except Exception:
                 data["quantity"] = 1
-        elif key == "is_vehicle_part":
-            vv = val.lower()
-            if vv in ("si", "sí", "yes", "true", "1"):
-                data["is_vehicle_part"] = True
-            elif vv in ("no", "false", "0"):
-                data["is_vehicle_part"] = False
-        elif key == "parent_vin":
-            data["parent_vin"] = normalize_vin(val)
-        else:
-            data[key] = val
-
-    if has_colon:
-        for p in parts:
-            if ":" not in p:
-                continue
-            k, v = p.split(":", 1)
-            k = k.strip().lower()
-            v = v.strip()
-            key = aliases.get(k)
-            if key:
-                _set(key, v)
-        return data
-
-    tokens = re.split(r"\s+", t.strip())
-    i = 0
-    current_key = None
-    buff = []
-
-    def flush():
-        nonlocal current_key, buff
-        if not current_key:
-            buff = []
-            return
-        _set(current_key, " ".join(buff).strip())
+        elif cur == "value":
+            data["value"] = val
+        elif cur == "is_vehicle_part":
+            data["is_vehicle_part"] = val.lower() in ("si", "sí", "yes", "true", "1")
         buff = []
 
     while i < len(tokens):
-        tok = re.sub(r"[^\wáéíóúüñ_]+", "", tokens[i].lower())
-        if tok in aliases:
+        tok = tokens[i].strip().lower()
+        tok_clean = re.sub(r"[^\wáéíóúüñ_]+", "", tok)
+        if tok_clean in aliases:
             flush()
-            current_key = aliases[tok]
+            cur = aliases[tok_clean]
             buff = []
         else:
             buff.append(tokens[i])
@@ -123,68 +155,17 @@ def _parse_article_dictation(text: str) -> dict:
     return data
 
 
-def _build_article_description(art_type, ref, brand, model, weight, condition, quantity, value) -> str:
-    parts = []
-    if art_type:
-        parts.append(str(art_type).strip())
-    if ref:
-        parts.append(f"Ref {str(ref).strip()}")
-    if brand:
-        parts.append(f"Marca {str(brand).strip()}")
-    if model:
-        parts.append(f"Modelo {str(model).strip()}")
-    if weight:
-        parts.append(f"Peso {str(weight).strip()}")
-    if condition:
-        parts.append(f"Estado {str(condition).strip()}")
-    parts.append(f"Cantidad {int(quantity or 1)}")
-    if value:
-        parts.append(f"Valor {str(value).strip()}")
-    return " | ".join(parts).strip()
+# ---------------------------
+# Tabs
+# ---------------------------
+tab_create, tab_manage, tab_list = st.tabs(["➕ Crear trámite", "🧰 Gestionar trámite", "📋 Listado & estatus"])
+
+client_name_by_id = _client_map()
 
 
-def _validate_ready_for_pending(case: dict, items_df) -> tuple[bool, list[str]]:
-    errors = []
-    if not case.get("case_id"):
-        errors.append("No hay case_id.")
-    if not case.get("client_id"):
-        errors.append("No hay client_id.")
-    if not (case.get("case_name") or "").strip():
-        errors.append("Falta nombre del trámite (case_name).")
-
-    if items_df is None or items_df.empty:
-        errors.append("El trámite no tiene items (vehículos/artículos).")
-        return (False, errors)
-
-    # Reglas mínimas operativas (sin inventar)
-    veh = items_df[items_df.get("item_type", "") == "vehicle"] if "item_type" in items_df.columns else None
-    if veh is None or veh.empty:
-        errors.append("Debe existir al menos 1 vehículo.")
-
-    # Vehículos: VIN + marca/modelo/año
-    if veh is not None and not veh.empty:
-        for _, r in veh.iterrows():
-            vin = str(r.get("unique_key", "")).strip()
-            if len(normalize_vin(vin)) != 17:
-                errors.append(f"Vehículo con VIN inválido: {vin}")
-            if not str(r.get("brand", "")).strip():
-                errors.append(f"Vehículo {vin}: falta Marca.")
-            if not str(r.get("model", "")).strip():
-                errors.append(f"Vehículo {vin}: falta Modelo.")
-            if not str(r.get("year", "")).strip():
-                errors.append(f"Vehículo {vin}: falta Año.")
-
-    return (len(errors) == 0, errors)
-
-
-tab_create, tab_manage, tab_list = st.tabs(
-    ["➕ Crear trámite", "🛠 Gestionar / Modificar", "📋 Listado + Estatus"]
-)
-
-
-# ======================================================
-# TAB 1 — CREAR
-# ======================================================
+# ============================================================
+# TAB 1: Crear trámite
+# ============================================================
 with tab_create:
     st.subheader("Crear trámite")
 
@@ -195,7 +176,8 @@ with tab_create:
 
     clients_df["label"] = clients_df["client_id"].astype(str) + " — " + clients_df["name"].astype(str)
 
-    c1, c2, c3 = st.columns([3, 2, 2])
+    c1, c2, c3 = st.columns([2, 2, 3])
+
     with c1:
         selected_label = st.selectbox("Cliente", clients_df["label"].tolist(), key="create_case_client")
         row = clients_df.loc[clients_df["label"] == selected_label].iloc[0]
@@ -204,484 +186,484 @@ with tab_create:
 
     with c2:
         origin = st.text_input("Origen", value="USA", key="create_case_origin")
-    with c3:
         destination = st.text_input("Destino", value="Guatemala", key="create_case_dest")
 
-    notes = st.text_input("Notas (opcional)", value="", key="create_case_notes")
-    st.info(f"Nombre del trámite (obligatorio): **{client_name}**")
+    with c3:
+        notes = st.text_input("Notas (opcional)", value="", key="create_case_notes")
 
     if st.button("Crear trámite", type="primary", key="create_case_btn"):
         try:
+            cases_df = list_cases().fillna("")
+            existing_ids = cases_df["case_id"].tolist() if "case_id" in cases_df.columns else []
+            year = _now_year()
+            # case_id lo genera create_case internamente, pero aquí lo necesitamos para carpeta (nombre)
+            # entonces generamos el siguiente con ids actuales:
+            from transit_core.ids import next_case_id
+            case_id_new = next_case_id(existing_ids, year=year)
+
+            root_folder_id = st.secrets["drive"]["root_folder_id"]
+            folder_name = f"{case_id_new} - {client_name}".strip()
+
+            res = create_case_folder_via_script(
+                root_folder_id=root_folder_id,
+                case_id=case_id_new,
+                folder_name=folder_name,
+            )
+            drive_folder_id = res.get("folder_id","")
+
             created_case_id = create_case(
                 client_id=client_id,
-                case_name=client_name,
                 origin=origin.strip() or "USA",
                 destination=destination.strip(),
                 notes=notes.strip(),
-                drive_folder_id="",
+                drive_folder_id=drive_folder_id,
             )
 
             st.success(f"✅ Trámite creado: {created_case_id}")
-            st.info("Ahora entra a 'Gestionar / Modificar' para crear carpeta Drive, agregar vehículo, artículos y documentos.")
+            st.info(f"📁 Carpeta: {folder_name}")
             st.rerun()
 
         except Exception as e:
             st.error(f"Error creando trámite: {type(e).__name__}: {e}")
 
 
-# ======================================================
-# TAB 2 — GESTIONAR
-# ======================================================
+# ============================================================
+# TAB 2: Gestionar trámite
+# ============================================================
 with tab_manage:
-    st.subheader("Gestionar / Modificar trámite")
+    st.subheader("Gestionar trámite")
 
     cases_df = list_cases().fillna("")
     if cases_df.empty:
         st.info("No hay trámites aún.")
         st.stop()
 
-    for col in ["case_name", "status"]:
-        if col not in cases_df.columns:
-            cases_df[col] = ""
+    # Por defecto: solo borrador
+    only_draft = st.checkbox("Mostrar solo trámites en Borrador", value=True, key="only_draft")
+    if only_draft and "status" in cases_df.columns:
+        view_df = cases_df[cases_df["status"].astype(str).str.lower() == "borrador"].copy()
+    else:
+        view_df = cases_df.copy()
 
-    cases_df["status"] = cases_df["status"].astype(str).str.upper().str.strip()
-    cases_df.loc[cases_df["status"] == "", "status"] = "BORRADOR"
-
-    edit_locked_cases = st.toggle("Editar trámites PENDIENTE/ENVIADO (requiere código)", value=False, key="toggle_edit_locked")
-    authorized = False
-    if edit_locked_cases:
-        code = st.text_input("Código de autorización", type="password", key="auth_code")
-        authorized = (code.strip() == "778899")
-        if code and not authorized:
-            st.error("Código incorrecto.")
-        if authorized:
-            st.success("Autorización válida. Edición habilitada.")
-
-    selectable_df = cases_df.copy() if authorized else cases_df[cases_df["status"] == "BORRADOR"].copy()
-    if selectable_df.empty:
-        st.warning("No hay trámites en BORRADOR para gestionar (o no tienes autorización).")
+    if view_df.empty:
+        st.info("No hay trámites para gestionar con ese filtro.")
         st.stop()
 
-    selectable_df["label"] = (
-        selectable_df["case_id"].astype(str)
-        + " — "
-        + selectable_df["case_name"].astype(str)
-        + " — ["
-        + selectable_df["status"].astype(str)
-        + "]"
-    )
+    # label con cliente
+    def _case_label(r):
+        cid = str(r.get("case_id",""))
+        clid = str(r.get("client_id",""))
+        cname = client_name_by_id.get(clid, "")
+        stt = str(r.get("status",""))
+        return f"{cid} — {cname} — {stt}"
 
-    selected_label = st.selectbox("Selecciona un trámite", selectable_df["label"].tolist(), key="case_select")
-    selected_case_id = selected_label.split(" — ")[0].strip()
+    view_df["label"] = view_df.apply(lambda r: _case_label(r), axis=1)
+    selected_label = st.selectbox("Selecciona un trámite", view_df["label"].tolist(), key="case_select")
 
-    case = get_case(str(selected_case_id))
+    row = view_df.loc[view_df["label"] == selected_label].iloc[0]
+    selected_case_id = str(row.get("case_id",""))
+    case = get_case(selected_case_id)
+
     if not case:
         st.error("No se pudo cargar el trámite.")
         st.stop()
 
     case_id = str(case.get("case_id") or "")
-    case_name = str(case.get("case_name") or "").strip()
-    case_status = str(case.get("status") or "BORRADOR").upper().strip()
+    case_status = str(case.get("status") or "")
+    case_client_id = str(case.get("client_id") or "")
+    case_client_name = client_name_by_id.get(case_client_id, "")
     drive_folder_id = str(case.get("drive_folder_id") or "")
-    client_id = str(case.get("client_id") or "")
 
-    items_df = list_items(case_id=case_id)
-    items_df = items_df.fillna("") if items_df is not None else items_df
+    # lock si no borrador
+    is_locked = False
+    if case_status.lower() != "borrador":
+        is_locked = True
+        st.warning(f"Este trámite está en '{case_status}'. Para modificar necesitas autorización.")
+        code = st.text_input("Código de autorización", type="password", key=f"unlock_{case_id}")
+        if code == OFFICE_EDIT_CODE:
+            is_locked = False
+            st.success("✅ Autorización correcta. Edición habilitada.")
 
-    is_locked = (case_status in ("PENDIENTE", "ENVIADO")) and (not authorized)
-    if is_locked:
-        st.warning("🔒 Trámite PENDIENTE/ENVIADO. Para modificar activa el toggle y usa el código.")
-
+    # Summary
+    st.divider()
+    st.subheader("Resumen del trámite")
     st.write(f"**Trámite:** {case_id}")
-    st.write(f"**Nombre:** {case_name}")
+    st.write(f"**Cliente:** {case_client_name} ({case_client_id})")
     st.write(f"**Estatus:** {case_status}")
-    st.write(f"**Cliente ID:** {client_id}")
-    st.write(f"**Drive folder:** {drive_folder_id}")
+    st.write(f"**Drive folder:** {drive_folder_id or '(sin carpeta)'}")
 
-    # -------- Carpeta Drive
-    if not drive_folder_id:
-        if st.button("📁 Crear carpeta en Drive", key=f"mk_drive_{case_id}", disabled=is_locked):
-            try:
-                root_folder_id = st.secrets.get("drive", {}).get("root_folder_id", "").strip()
-                if not root_folder_id:
-                    raise RuntimeError("Falta secret: drive.root_folder_id")
+    items_df = list_items(case_id=case_id).fillna("")
+    docs_df = list_documents(case_id=case_id).fillna("")
 
-                folder_name = f"{case_id} - {case_name}".strip()
-                res = create_case_folder_via_script(
-                    root_folder_id=root_folder_id,
-                    case_id=case_id,
-                    folder_name=folder_name,
-                )
-                drive_folder_id = res.get("folder_id", "")
-                if not drive_folder_id:
-                    raise RuntimeError(f"No se recibió folder_id: {res}")
-
-                update_case_fields(case_id, {"drive_folder_id": drive_folder_id})
-                st.success("✅ Carpeta creada y vinculada al trámite.")
-                st.rerun()
-
-            except Exception as e:
-                st.error(f"Error creando carpeta: {type(e).__name__}: {e}")
+    cA, cB, cC = st.columns(3)
+    with cA:
+        st.metric("Vehículos", int((items_df["item_type"] == "vehicle").sum()) if not items_df.empty else 0)
+    with cB:
+        st.metric("Artículos", int((items_df["item_type"] == "article").sum()) if not items_df.empty else 0)
+    with cC:
+        st.metric("Documentos", int(len(docs_df)) if not docs_df.empty else 0)
 
     st.divider()
-
-    # -------- Validar y pasar a PENDIENTE (status automático)
-    st.subheader("✅ Validación del trámite")
-    ok, errs = _validate_ready_for_pending(case, items_df)
-    if ok:
-        st.success("Checklist OK. Este trámite está completo para pasar a PENDIENTE.")
+    st.subheader("Items registrados")
+    if items_df.empty:
+        st.info("Aún no hay vehículos ni artículos en este trámite.")
     else:
-        st.warning("Faltan cosas para poder pasar a PENDIENTE:")
-        for er in errs[:25]:
-            st.write(f"- {er}")
+        show = items_df.copy()
 
-    if st.button("Validar y pasar a PENDIENTE", type="primary", key=f"to_pending_{case_id}", disabled=is_locked or (not ok)):
+        # ✅ Mostrar consecutivo REAL por trámite (case_seq)
+        if "case_seq" in show.columns:
+            show = show.sort_values(by=["case_seq"], ascending=True)
+
+        # ✅ Quitar el índice de Streamlit (la columna de la izquierda que te muestra '8')
+        show = show.reset_index(drop=True)
+
+        st.dataframe(show, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("Documentos del trámite")
+    if docs_df.empty:
+        st.info("Aún no hay documentos registrados.")
+    else:
+        st.dataframe(docs_df.reset_index(drop=True), use_container_width=True, hide_index=True)
+
+    # ---------------------------
+    # VALIDACIÓN -> cambia estatus a Pendiente
+    # ---------------------------
+    st.divider()
+    st.subheader("Validación del trámite")
+
+    st.caption("Marca este check cuando TODO el trámite esté completo. Al guardar, cambia a Pendiente automáticamente.")
+    ready_key = f"case_ready_{case_id}"
+    ready = st.checkbox("✅ Toda la información del trámite está completa y lista para envío", key=ready_key, disabled=is_locked)
+
+    if st.button("Guardar validación", type="primary", disabled=is_locked, key=f"save_validation_{case_id}"):
         try:
-            update_case_fields(case_id, {"status": "Pendiente"})
-            st.success("✅ Estatus actualizado a PENDIENTE.")
-            st.rerun()
+            if ready:
+                update_case_fields(case_id, {"status": "Pendiente", "updated_at": datetime.now().isoformat(timespec="seconds")})
+                st.success("✅ Estatus actualizado a Pendiente.")
+                st.rerun()
+            else:
+                st.info("No marcaste el check. No se cambió el estatus.")
         except Exception as e:
             st.error(f"Error actualizando estatus: {type(e).__name__}: {e}")
 
+    # ---------------------------
+    # ACCORDIONS
+    # ---------------------------
     st.divider()
 
-    st.subheader("Items registrados")
-    if items_df is None or items_df.empty:
-        st.info("Aún no hay vehículos ni artículos en este trámite.")
-    else:
-        st.dataframe(items_df, use_container_width=True)
+    # ============================================================
+    # Expander: VEHÍCULO
+    # ============================================================
+    with st.expander("Agregar vehículo", expanded=False):
+        st.caption("Dicta o pega el VIN (17 caracteres).")
 
-    # ======================================================
-    # VEHÍCULO — SOLO TEXTO
-    # ======================================================
-    st.divider()
-    st.subheader("Agregar vehículo")
+        vin_text_key = f"vin_text_{case_id}"
+        dec_key = f"vin_decoded_{case_id}"
+        confirm_vin_key = f"vin_confirm_{case_id}"
 
-    vin_method = st.radio(
-        "Método VIN",
-        ["Copiar/Pegar", "Dictado"],
-        horizontal=True,
-        key=f"vin_method_{case_id}",
-        disabled=is_locked,
-    )
+        st.session_state.setdefault(vin_text_key, "")
+        st.session_state.setdefault(dec_key, {})
 
-    if vin_method == "Copiar/Pegar":
-        vin_text = st.text_input("Pega el VIN aquí", value="", key=f"vin_paste_{case_id}", disabled=is_locked)
-    else:
-        st.caption("Dicta claramente, con voz fuerte y sin pausas extremas.")
-        vin_text = st.text_area("Dictado", height=70, key=f"vin_dict_{case_id}", disabled=is_locked)
-
-    cands = _extract_vin_candidates(vin_text)
-    if cands:
-        vin_selected = st.selectbox("VIN detectado por el texto", cands, key=f"vin_detected_{case_id}", disabled=is_locked)
-        vin_norm = normalize_vin(vin_selected)
-    else:
+        vin_text = st.text_input("VIN detectado por el texto", key=vin_text_key, disabled=is_locked)
         vin_norm = normalize_vin(vin_text)
 
-    if vin_norm:
-        st.write(f"**VIN normalizado:** `{vin_norm}`")
+        with st.expander("🧪 Debug VIN (punto exacto de lectura)"):
+            st.write("Texto recibido:", vin_text)
+            st.write("vin_norm:", vin_norm)
+            st.write("len:", len(vin_norm))
+            st.write("is_valid_vin:", is_valid_vin(vin_norm) if len(vin_norm) == 17 else False)
 
-    valid_len = (len(vin_norm) == 17)
-    valid_chars = (is_valid_vin(vin_norm) if valid_len else False)
+        can_decode = bool(vin_norm) and len(vin_norm) == 17 and is_valid_vin(vin_norm)
 
-    # session keys
-    dec_key = f"vin_decoded_{case_id}"
-    st.session_state.setdefault(dec_key, {})
-    vin_last_key = f"vin_last_{case_id}"
-    st.session_state.setdefault(vin_last_key, "")
+        if st.button("Consultar información del vehículo", disabled=(is_locked or not can_decode), key=f"decode_{case_id}"):
+            out = decode_vin(vin_norm) or {}
+            st.session_state[dec_key] = out
+            if out.get("error"):
+                st.warning(out["error"])
+            else:
+                st.success("✅ Info consultada. Revisa antes de guardar.")
 
-    veh_brand_key = f"veh_brand_{case_id}"
-    veh_model_key = f"veh_model_{case_id}"
-    veh_year_key = f"veh_year_{case_id}"
-    veh_weight_key = f"veh_weight_{case_id}"
+        decoded = st.session_state.get(dec_key, {}) or {}
 
-    # extras
-    veh_trim_key = f"veh_trim_{case_id}"
-    veh_engine_key = f"veh_engine_{case_id}"
-    veh_vtype_key = f"veh_vehicle_type_{case_id}"
-    veh_body_key = f"veh_body_class_{case_id}"
-    veh_plant_key = f"veh_plant_country_{case_id}"
-    veh_gvwr_key = f"veh_gvwr_{case_id}"
-    veh_cw_key = f"veh_curb_weight_{case_id}"
-
-    for k in [
-        veh_brand_key, veh_model_key, veh_year_key, veh_weight_key,
-        veh_trim_key, veh_engine_key, veh_vtype_key, veh_body_key, veh_plant_key, veh_gvwr_key, veh_cw_key
-    ]:
-        st.session_state.setdefault(k, "")
-
-    if vin_norm and vin_norm != st.session_state[vin_last_key]:
-        st.session_state[vin_last_key] = vin_norm
-        st.session_state[dec_key] = {}
-        for k in [
-            veh_brand_key, veh_model_key, veh_year_key,
-            veh_trim_key, veh_engine_key, veh_vtype_key, veh_body_key, veh_plant_key, veh_gvwr_key, veh_cw_key
-        ]:
-            st.session_state[k] = ""
-
-    with st.expander("🧪 Debug VIN (punto exacto de lectura)"):
-        st.write("Texto recibido:", vin_text)
-        st.write("Candidatos:", cands)
-        st.write("vin_norm:", vin_norm)
-        st.write("len:", len(vin_norm))
-        st.write("is_valid_vin:", valid_chars)
-
-    consult_disabled = is_locked or (not vin_norm) or (not valid_len) or (not valid_chars)
-
-    if st.button("Consultar información del vehículo", key=f"vin_decode_btn_{case_id}", disabled=consult_disabled):
-        out = decode_vin(vin_norm) or {}
-        st.session_state[dec_key] = out
-
-        if out.get("error"):
-            st.error(out.get("error"))
-        else:
-            # principales
-            st.session_state[veh_brand_key] = str(out.get("brand", "") or "")
-            st.session_state[veh_model_key] = str(out.get("model", "") or "")
-            st.session_state[veh_year_key] = str(out.get("year", "") or "")
-
-            # extras
-            st.session_state[veh_trim_key] = str(out.get("trim", "") or "")
-            st.session_state[veh_engine_key] = str(out.get("engine", "") or "")
-            st.session_state[veh_vtype_key] = str(out.get("vehicle_type", "") or "")
-            st.session_state[veh_body_key] = str(out.get("body_class", "") or "")
-            st.session_state[veh_plant_key] = str(out.get("plant_country", "") or "")
-            st.session_state[veh_gvwr_key] = str(out.get("gvwr", "") or "")
-            st.session_state[veh_cw_key] = str(out.get("curb_weight", "") or "")
-
-            st.success("✅ Info consultada. Revisa antes de guardar.")
-
-    decoded = st.session_state.get(dec_key, {}) or {}
-    if decoded:
         with st.expander("🧪 Debug decoder (respuesta completa)"):
             st.json(decoded)
 
-    st.subheader("Datos del vehículo")
-    st.text_input("Marca", key=veh_brand_key, disabled=is_locked)
-    st.text_input("Modelo", key=veh_model_key, disabled=is_locked)
-    st.text_input("Año", key=veh_year_key, disabled=is_locked)
-    st.text_input("Peso (opcional)", key=veh_weight_key, disabled=is_locked)
+        st.subheader("Datos del vehículo")
 
-    st.subheader("Información técnica (NHTSA)")
-    st.text_input("Trim", key=veh_trim_key, disabled=True)
-    st.text_input("Engine", key=veh_engine_key, disabled=True)
-    st.text_input("Vehicle Type", key=veh_vtype_key, disabled=True)
-    st.text_input("Body Class", key=veh_body_key, disabled=True)
-    st.text_input("Plant Country", key=veh_plant_key, disabled=True)
-    st.text_input("GVWR", key=veh_gvwr_key, disabled=True)
-    st.text_input("Curb Weight", key=veh_cw_key, disabled=True)
+        # Campos principales
+        veh_brand_key = f"veh_brand_{case_id}"
+        veh_model_key = f"veh_model_{case_id}"
+        veh_year_key = f"veh_year_{case_id}"
+        veh_weight_key = f"veh_weight_{case_id}"  # opcional
 
-    confirm_save_vehicle = st.checkbox(
-        "✅ Confirmo que VIN + datos del vehículo están listos para guardar",
-        value=False,
-        key=f"veh_confirm_save_{case_id}",
-        disabled=is_locked,
-    )
+        # extras
+        veh_trim_key = f"veh_trim_{case_id}"
+        veh_engine_key = f"veh_engine_{case_id}"
+        veh_vtype_key = f"veh_vtype_{case_id}"
+        veh_body_key = f"veh_body_{case_id}"
+        veh_plant_key = f"veh_plant_{case_id}"
+        veh_gvwr_key = f"veh_gvwr_{case_id}"
+        veh_cw_key = f"veh_cw_{case_id}"
 
-    if st.button("Guardar vehículo", type="primary", disabled=is_locked or (not confirm_save_vehicle), key=f"veh_save_{case_id}"):
-        try:
-            if len(vin_norm) != 17:
-                raise ValueError("VIN debe tener 17 caracteres.")
-            if not is_valid_vin(vin_norm):
-                raise ValueError("VIN inválido. Debe tener 17 caracteres y NO incluir I/O/Q.")
+        # defaults (solo si aún no existen)
+        st.session_state.setdefault(veh_brand_key, _safe_str(decoded.get("brand","")))
+        st.session_state.setdefault(veh_model_key, _safe_str(decoded.get("model","")))
+        st.session_state.setdefault(veh_year_key, _safe_str(decoded.get("year","")))
+        st.session_state.setdefault(veh_weight_key, "")
 
-            add_vehicle_item(
-                case_id=case_id,
-                vin=vin_norm,
-                brand=st.session_state[veh_brand_key],
-                model=st.session_state[veh_model_key],
-                year=st.session_state[veh_year_key],
-                description="",
-                weight=st.session_state[veh_weight_key],
-                value="0",
-                source="vin_text",
-                trim=st.session_state[veh_trim_key],
-                engine=st.session_state[veh_engine_key],
-                vehicle_type=st.session_state[veh_vtype_key],
-                body_class=st.session_state[veh_body_key],
-                plant_country=st.session_state[veh_plant_key],
-                gvwr=st.session_state[veh_gvwr_key],
-                curb_weight=st.session_state[veh_cw_key],
-            )
+        st.session_state.setdefault(veh_trim_key, _safe_str(decoded.get("trim","")))
+        st.session_state.setdefault(veh_engine_key, _safe_str(decoded.get("engine","")))
+        st.session_state.setdefault(veh_vtype_key, _safe_str(decoded.get("vehicle_type","")))
+        st.session_state.setdefault(veh_body_key, _safe_str(decoded.get("body_class","")))
+        st.session_state.setdefault(veh_plant_key, _safe_str(decoded.get("plant_country","")))
+        st.session_state.setdefault(veh_gvwr_key, _safe_str(decoded.get("gvwr","")))
+        st.session_state.setdefault(veh_cw_key, _safe_str(decoded.get("curb_weight","")))
 
-            st.success("✅ Vehículo guardado correctamente.")
-            st.rerun()
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            brand = st.text_input("Marca", key=veh_brand_key, disabled=is_locked)
+        with c2:
+            model = st.text_input("Modelo", key=veh_model_key, disabled=is_locked)
+        with c3:
+            year = st.text_input("Año", key=veh_year_key, disabled=is_locked)
 
-        except Exception as e:
-            st.error(f"Error guardando vehículo: {type(e).__name__}: {e}")
+        st.text_input("Peso (opcional)", key=veh_weight_key, disabled=is_locked)
 
-    # ======================================================
-    # ARTÍCULOS
-    # ======================================================
-    st.divider()
-    st.subheader("Agregar artículo (dictado)")
+        st.divider()
+        st.caption("Campos adicionales (si vienen en el decoder, se guardan; si no, quedan vacíos).")
 
-    st.caption("Ejemplo continuo: tipo lavadora ref 440827 marca Sienna modelo Sleep4415 peso 95 lb estado usado cantidad 1 parte_vehiculo no valor 120")
-    st.caption("Ejemplo con ':' : tipo: lavadora | ref: 440827 | marca: Sienna | modelo: Sleep4415 | peso: 95 lb | estado: usado | cantidad: 1 | parte_vehiculo: no | valor: 120")
+        x1, x2, x3 = st.columns(3)
+        with x1:
+            trim = st.text_input("Trim", key=veh_trim_key, disabled=is_locked)
+        with x2:
+            engine = st.text_input("Engine", key=veh_engine_key, disabled=is_locked)
+        with x3:
+            vtype = st.text_input("Vehicle Type", key=veh_vtype_key, disabled=is_locked)
 
-    dictation = st.text_area("Dictado", height=90, key=f"art_dict_{case_id}", disabled=is_locked)
-    parsed = _parse_article_dictation(dictation)
+        y1, y2, y3 = st.columns(3)
+        with y1:
+            body = st.text_input("Body Class", key=veh_body_key, disabled=is_locked)
+        with y2:
+            plant = st.text_input("Plant Country", key=veh_plant_key, disabled=is_locked)
+        with y3:
+            gvwr = st.text_input("GVWR", key=veh_gvwr_key, disabled=is_locked)
 
-    with st.expander("🧪 Debug dictado parseado"):
-        st.json(parsed)
+        st.text_input("Curb Weight", key=veh_cw_key, disabled=is_locked)
 
-    art_type = st.text_input("Tipo de artículo (lavadora, secadora, caja de herramientas, etc.)", value=parsed.get("type",""), key=f"art_type_{case_id}", disabled=is_locked)
-    art_ref = st.text_input("Serie/Referencia", value=parsed.get("ref",""), key=f"art_ref_{case_id}", disabled=is_locked)
-    art_brand = st.text_input("Marca", value=parsed.get("brand",""), key=f"art_brand_{case_id}", disabled=is_locked)
-    art_model = st.text_input("Modelo", value=parsed.get("model",""), key=f"art_model_{case_id}", disabled=is_locked)
-    art_weight = st.text_input("Peso (lb/kg)", value=parsed.get("weight",""), key=f"art_weight_{case_id}", disabled=is_locked)
+        st.divider()
+        st.subheader("Evidencia VIN (opcional: foto/pdf, NO OCR)")
+        evidence = st.file_uploader(
+            "Sube evidencia del VIN",
+            type=["jpg","jpeg","png","pdf"],
+            key=f"vin_evidence_{case_id}",
+            disabled=is_locked,
+        )
+        if evidence is not None:
+            st.info(f"Evidencia cargada: {evidence.name} (pendiente de subir a Drive en el módulo Documentos)")
 
-    # estado automático desde dictado (sin dropdown)
-    art_condition = st.text_input("Estado (nuevo/usado)", value=parsed.get("condition",""), key=f"art_cond_{case_id}", disabled=is_locked)
-
-    try:
-        qty_default = int(parsed.get("quantity", 1) or 1)
-    except Exception:
-        qty_default = 1
-    art_qty = st.number_input("Cantidad", min_value=1, value=qty_default, step=1, key=f"art_qty_{case_id}", disabled=is_locked)
-
-    is_part = st.checkbox("¿Es parte del vehículo?", value=bool(parsed.get("is_vehicle_part", False)), key=f"art_is_part_{case_id}", disabled=is_locked)
-
-    parent_vin = ""
-    if is_part:
-        vins = []
-        if items_df is not None and not items_df.empty and "item_type" in items_df.columns and "unique_key" in items_df.columns:
-            vins = items_df[items_df["item_type"] == "vehicle"]["unique_key"].tolist()
-            vins = [v for v in vins if v]
-        if vins:
-            parent_vin = st.selectbox("VIN del vehículo al que pertenece", vins, key=f"art_parent_vin_sel_{case_id}", disabled=is_locked)
-        else:
-            parent_vin = st.text_input("VIN del vehículo", value=parsed.get("parent_vin",""), key=f"art_parent_vin_txt_{case_id}", disabled=is_locked)
-
-    art_value = st.text_input("Valor (USD) (opcional)", value=parsed.get("value",""), key=f"art_value_{case_id}", disabled=is_locked)
-
-    auto_desc = _build_article_description(
-        art_type, art_ref, art_brand, art_model, art_weight, art_condition, art_qty, art_value
-    )
-
-    desc_final = auto_desc
-    if is_part:
-        pv = normalize_vin(parent_vin)
-        if pv and len(pv) == 17 and is_valid_vin(pv):
-            desc_final = f"[PARTE_DE_VEHICULO:{pv}] {desc_final}".strip()
-        else:
-            desc_final = f"[PARTE_DE_VEHICULO] {desc_final}".strip()
-
-    st.text_area("Descripción (automática)", value=desc_final, height=80, key=f"art_desc_auto_{case_id}", disabled=True)
-
-    confirm_article = st.checkbox(
-        "✅ Confirmo que la información del artículo es correcta antes de guardar.",
-        value=False,
-        key=f"art_confirm_{case_id}",
-        disabled=is_locked,
-    )
-
-    if st.button("Guardar artículo", type="primary", disabled=is_locked or (not confirm_article), key=f"save_article_{case_id}"):
-        try:
-            add_article_item(
-                case_id=case_id,
-                description=desc_final,
-                brand=art_brand,
-                model=art_model,
-                quantity=int(art_qty),
-                weight=art_weight,
-                value=art_value,
-                source="voice" if dictation.strip() else "manual",
-            )
-            st.success("✅ Artículo guardado correctamente.")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Error guardando artículo: {type(e).__name__}: {e}")
-
-    # ======================================================
-    # DOCUMENTOS — UN SOLO PUNTO
-    # ======================================================
-    st.divider()
-    st.subheader("📎 Documentos del trámite (cliente / vehículos / artículos)")
-
-    if not drive_folder_id:
-        st.warning("Este trámite aún NO tiene carpeta en Drive. Créala arriba.")
-    else:
-        docs_df = list_documents(case_id).fillna("")
-        if docs_df.empty:
-            st.info("Aún no hay documentos registrados.")
-        else:
-            st.dataframe(docs_df, use_container_width=True)
-
-        attach_options = [("Trámite / Cliente (general)", "")]
-        if items_df is not None and not items_df.empty:
-            if "item_id" in items_df.columns:
-                for _, r in items_df.iterrows():
-                    item_id = str(r.get("item_id", "")).strip()
-                    itype = str(r.get("item_type", "")).strip()
-                    ukey = str(r.get("unique_key", "")).strip()
-                    attach_options.append((f"{itype.upper()} — {ukey}", item_id))
-
-        attach_label = st.selectbox("¿A qué pertenece?", [x[0] for x in attach_options], key=f"doc_attach_sel_{case_id}", disabled=is_locked)
-        attach_item_id = dict(attach_options).get(attach_label, "")
-
-        doc_type = st.selectbox(
-            "Tipo de documento",
-            ["vin_evidence", "passport", "driver_license", "title", "invoice", "bill_of_sale", "other"],
-            key=f"doc_type_{case_id}",
+        confirm_vehicle = st.checkbox(
+            "✅ Confirmo que VIN + datos del vehículo están listos para guardar",
+            key=confirm_vin_key,
             disabled=is_locked,
         )
 
-        upload = st.file_uploader(
-            "Subir documento (pdf/jpg/png)",
-            type=["pdf", "jpg", "jpeg", "png"],
-            key=f"doc_uploader_{case_id}",
-            disabled=is_locked,
-        )
-
-        if st.button("Subir documento a Drive", type="primary", key=f"doc_upload_btn_{case_id}", disabled=is_locked or (upload is None)):
+        if st.button("Guardar vehículo", type="primary", disabled=(is_locked or not confirm_vehicle), key=f"save_vehicle_{case_id}"):
             try:
-                up = upload_file_to_case_folder_via_script(
-                    case_folder_id=drive_folder_id,
-                    file_bytes=upload.getvalue(),
-                    file_name=upload.name,
-                    mime_type=upload.type or "application/octet-stream",
-                    subfolder="DOCUMENTOS",
-                )
-                drive_file_id = up.get("file_id", "")
-                if not drive_file_id:
-                    raise RuntimeError(f"No se recibió file_id del script: {up}")
+                if not can_decode:
+                    raise ValueError("VIN inválido o incompleto. Debe ser 17 caracteres válidos sin I/O/Q.")
 
-                add_document(
+                add_vehicle_item(
                     case_id=case_id,
-                    item_id=attach_item_id,
-                    doc_type=doc_type,
-                    drive_file_id=drive_file_id,
-                    file_name=upload.name,
+                    vin=vin_norm,
+                    brand=brand,
+                    model=model,
+                    year=year,
+                    description="",
+                    weight=st.session_state.get(veh_weight_key,""),
+                    value="0",
+                    source="vin_text",
+                    trim=trim,
+                    engine=engine,
+                    vehicle_type=vtype,
+                    body_class=body,
+                    plant_country=plant,
+                    gvwr=gvwr,
+                    curb_weight=st.session_state.get(veh_cw_key,""),
                 )
 
-                st.success("✅ Documento subido y registrado.")
+                st.success("✅ Vehículo guardado correctamente.")
+
+                # limpiar formulario
+                st.session_state[vin_text_key] = ""
+                st.session_state[dec_key] = {}
+                st.session_state[confirm_vin_key] = False
+                for k in [veh_brand_key, veh_model_key, veh_year_key, veh_weight_key,
+                          veh_trim_key, veh_engine_key, veh_vtype_key, veh_body_key, veh_plant_key, veh_gvwr_key, veh_cw_key]:
+                    st.session_state[k] = ""
                 st.rerun()
 
             except Exception as e:
-                st.error(f"Error subiendo documento: {type(e).__name__}: {e}")
+                st.error(f"Error guardando vehículo: {type(e).__name__}: {e}")
+
+    # ============================================================
+    # Expander: ARTÍCULOS
+    # ============================================================
+    with st.expander("Agregar artículos", expanded=False):
+        st.caption("Dicta claramente, con voz clara y fuerte.")
+
+        dict_key = f"art_dict_{case_id}"
+        st.session_state.setdefault(dict_key, "")
+
+        dictation = st.text_area("Dictado", height=90, key=dict_key, disabled=is_locked)
+
+        parsed = _parse_article_dictation(dictation)
+
+        with st.expander("🧪 Debug dictado parseado"):
+            st.json(parsed)
+
+        apply_btn = st.button("Aplicar dictado a campos", key=f"apply_art_{case_id}", disabled=is_locked)
+
+        # keys
+        k_type = f"art_type_{case_id}"
+        k_ref = f"art_ref_{case_id}"
+        k_brand = f"art_brand_{case_id}"
+        k_model = f"art_model_{case_id}"
+        k_weight = f"art_weight_{case_id}"
+        k_cond = f"art_cond_{case_id}"
+        k_qty = f"art_qty_{case_id}"
+        k_part = f"art_is_part_{case_id}"
+        k_value = f"art_value_{case_id}"
+        k_confirm = f"art_confirm_{case_id}"
+
+        st.session_state.setdefault(k_type, "")
+        st.session_state.setdefault(k_ref, "")
+        st.session_state.setdefault(k_brand, "")
+        st.session_state.setdefault(k_model, "")
+        st.session_state.setdefault(k_weight, "")
+        st.session_state.setdefault(k_cond, "")
+        st.session_state.setdefault(k_qty, 1)
+        st.session_state.setdefault(k_part, False)
+        st.session_state.setdefault(k_value, "")
+
+        if apply_btn:
+            st.session_state[k_type] = parsed.get("type","") or ""
+            st.session_state[k_ref] = parsed.get("ref","") or ""
+            st.session_state[k_brand] = parsed.get("brand","") or ""
+            st.session_state[k_model] = parsed.get("model","") or ""
+            st.session_state[k_weight] = parsed.get("weight","") or ""
+            st.session_state[k_cond] = parsed.get("condition","") or ""
+            try:
+                st.session_state[k_qty] = int(parsed.get("quantity", 1) or 1)
+            except Exception:
+                st.session_state[k_qty] = 1
+            st.session_state[k_part] = bool(parsed.get("is_vehicle_part", False))
+            st.session_state[k_value] = parsed.get("value","") or ""
+            st.success("✅ Dictado aplicado a los campos.")
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            art_type = st.text_input("Tipo de artículo", key=k_type, disabled=is_locked)
+        with c2:
+            art_ref = st.text_input("Serie/Referencia", key=k_ref, disabled=is_locked)
+        with c3:
+            art_brand = st.text_input("Marca", key=k_brand, disabled=is_locked)
+
+        d1, d2, d3 = st.columns(3)
+        with d1:
+            art_model = st.text_input("Modelo", key=k_model, disabled=is_locked)
+        with d2:
+            art_weight = st.text_input("Peso (lb/kg)", key=k_weight, disabled=is_locked)
+        with d3:
+            art_condition = st.text_input("Estado (nuevo/usado)", key=k_cond, disabled=is_locked)
+
+        art_qty = st.number_input("Cantidad", min_value=1, value=int(st.session_state[k_qty]), step=1, key=k_qty, disabled=is_locked)
+        is_part = st.checkbox("¿Es parte del vehículo?", key=k_part, disabled=is_locked)
+        art_value = st.text_input("Valor (USD) (opcional)", key=k_value, disabled=is_locked)
+
+        # parent vin si es parte del vehículo
+        parent_vin = ""
+        if is_part:
+            vins = []
+            if not items_df.empty and "item_type" in items_df.columns and "unique_key" in items_df.columns:
+                vins = items_df[items_df["item_type"] == "vehicle"]["unique_key"].tolist()
+                vins = [v for v in vins if v]
+            if vins:
+                parent_vin = st.selectbox("Selecciona el VIN del vehículo", vins, disabled=is_locked, key=f"art_parent_{case_id}")
+            else:
+                st.warning("No hay vehículos registrados en este trámite para asociar.")
+                parent_vin = ""
+
+        # descripción automática
+        auto_desc = _auto_article_desc(art_type, art_ref, art_brand, art_model, art_weight, art_condition, art_qty, art_value)
+        if is_part and parent_vin:
+            pv = normalize_vin(parent_vin)
+            if pv and len(pv) == 17 and is_valid_vin(pv):
+                auto_desc = f"[PARTE_DE_VEHICULO:{pv}] {auto_desc}".strip()
+
+        st.text_area("Descripción (auto)", value=auto_desc, height=80, disabled=True, key=f"art_desc_auto_{case_id}")
+
+        confirm_article = st.checkbox(
+            "✅ Confirmo que la información del artículo es correcta antes de guardar.",
+            key=k_confirm,
+            disabled=is_locked,
+        )
+
+        if st.button("Guardar artículo", type="primary", disabled=(is_locked or not confirm_article), key=f"save_article_{case_id}"):
+            try:
+                # generar unique_key por trámite (A-CASEID-0001)
+                existing_keys = []
+                if not items_df.empty and "unique_key" in items_df.columns:
+                    existing_keys = items_df["unique_key"].tolist()
+                unique_key = next_article_seq(existing_keys, case_id=case_id)
+
+                add_article_item(
+                    case_id=case_id,
+                    unique_key=unique_key,
+                    description=auto_desc,
+                    brand=art_brand,
+                    model=art_model,
+                    quantity=int(art_qty),
+                    weight=art_weight,
+                    value=art_value,
+                    source="voice" if dictation.strip() else "manual",
+                )
+
+                st.success(f"✅ Artículo guardado correctamente: {unique_key}")
+
+                # limpiar para agregar más
+                st.session_state[dict_key] = ""
+                for k in [k_type, k_ref, k_brand, k_model, k_weight, k_cond, k_value]:
+                    st.session_state[k] = ""
+                st.session_state[k_qty] = 1
+                st.session_state[k_part] = False
+                st.session_state[k_confirm] = False
+                st.rerun()
+
+            except Exception as e:
+                st.error(f"Error guardando artículo: {type(e).__name__}: {e}")
 
 
-# ======================================================
-# TAB 3 — LISTADO
-# ======================================================
+# ============================================================
+# TAB 3: Listado & Estatus
+# ============================================================
 with tab_list:
     st.subheader("Listado de trámites y estatus")
-    df = list_cases().fillna("")
-    if df.empty:
-        st.info("No hay trámites registrados.")
+
+    cases_df = list_cases().fillna("")
+    if cases_df.empty:
+        st.info("No hay trámites aún.")
+        st.stop()
+
+    # agregar nombre de cliente
+    if "client_id" in cases_df.columns:
+        cases_df["client_name"] = cases_df["client_id"].astype(str).map(lambda x: client_name_by_id.get(x, ""))
     else:
-        for col in ["case_id", "case_name", "status", "origin", "destination", "created_at", "updated_at"]:
-            if col not in df.columns:
-                df[col] = ""
+        cases_df["client_name"] = ""
 
-        df["status"] = df["status"].astype(str).str.upper().str.strip()
-        df.loc[df["status"] == "", "status"] = "BORRADOR"
+    # vista ordenada
+    cols = [c for c in ["case_id","client_name","status","origin","destination","case_date","drive_folder_id"] if c in cases_df.columns]
+    view = cases_df[cols].copy() if cols else cases_df.copy()
+    view = view.sort_values(by=["status","case_id"], ascending=[True, True]).reset_index(drop=True)
 
-        status_filter = st.selectbox("Filtrar estatus", ["TODOS", "BORRADOR", "PENDIENTE", "ENVIADO"], index=0)
-        view = df.copy()
-        if status_filter != "TODOS":
-            view = view[view["status"] == status_filter]
-
-        cols = [c for c in ["case_id","case_name","status","origin","destination","created_at","updated_at"] if c in view.columns]
-        st.dataframe(view[cols], use_container_width=True)
+    st.dataframe(view, use_container_width=True, hide_index=True)
