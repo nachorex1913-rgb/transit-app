@@ -25,13 +25,63 @@ from transit_core.drive_bridge import (
 from transit_core.ids import next_case_id
 from transit_core.validators import normalize_vin, is_valid_vin
 from transit_core.vin_decode import decode_vin
-from transit_core.pdf_builder import build_case_summary_pdf_bytes
+
+from transit_core.pdf_builder import build_case_summary_pdf_bytes  # NO tocamos PDF en esta fase
+
 
 st.set_page_config(page_title="Trámites", layout="wide")
 st.title("Trámites")
 
 OFFICE_EDIT_CODE = "778899"
 DOC_TYPES = ["ID_CLIENTE", "TITULO_VEHICULO", "FACTURA_VEHICULO", "FACTURA_ARTICULO", "OTRO"]
+
+
+# ----------------------------
+# Estilos (corporativo/aduana)
+# ----------------------------
+st.markdown(
+    """
+    <style>
+      .card {
+        border: 1px solid rgba(255,255,255,0.10);
+        border-radius: 14px;
+        padding: 16px 16px;
+        background: rgba(255,255,255,0.03);
+      }
+      .card h2, .card h3, .card p { margin: 0; }
+      .muted { opacity: 0.75; }
+      .kpi {
+        border: 1px solid rgba(255,255,255,0.10);
+        border-radius: 14px;
+        padding: 14px 12px;
+        background: rgba(255,255,255,0.02);
+      }
+      .kpi .label { font-size: 0.85rem; opacity: 0.75; }
+      .kpi .value { font-size: 1.8rem; font-weight: 700; line-height: 1.1; margin-top: 4px; }
+      .badge {
+        display: inline-block;
+        padding: 6px 10px;
+        border-radius: 999px;
+        font-weight: 700;
+        font-size: 0.85rem;
+        border: 1px solid rgba(255,255,255,0.18);
+        background: rgba(255,255,255,0.04);
+      }
+      .badge.borrador { color: #f59e0b; }
+      .badge.pendiente { color: #60a5fa; }
+      .badge.enviado { color: #34d399; }
+      .badge.otro { color: #e5e7eb; }
+      .section-title {
+        font-weight: 800;
+        font-size: 1.05rem;
+        letter-spacing: 0.2px;
+        margin: 12px 0 6px 0;
+        opacity: 0.92;
+      }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
 
 
 def _safe(s: str) -> str:
@@ -54,8 +104,33 @@ def _case_label(case_row: dict, clients_df) -> str:
     return f"{cid} — {client_name} ({status})".strip()
 
 
+def _status_badge(status: str) -> str:
+    s = (status or "").strip().lower()
+    if s == "borrador":
+        cls = "borrador"
+        text = "BORRADOR"
+    elif s == "pendiente":
+        cls = "pendiente"
+        text = "PENDIENTE"
+    elif s == "enviado":
+        cls = "enviado"
+        text = "ENVIADO"
+    else:
+        cls = "otro"
+        text = (status or "N/D").upper()
+    return f'<span class="badge {cls}">{text}</span>'
+
+
+def _drive_folder_url(folder_id: str) -> str:
+    folder_id = (folder_id or "").strip()
+    if not folder_id:
+        return ""
+    return f"https://drive.google.com/drive/folders/{folder_id}"
+
+
 def _parse_article_dictation(text: str) -> dict:
     """
+    Dictado continuo:
     tipo lavadora ref 440827 marca Sienna modelo Sleep4415 peso 95 lb estado usado cantidad 1 valor 120 parte_vehiculo no
     """
     t = _norm_spaces(text)
@@ -147,59 +222,6 @@ def _build_article_description(d: dict) -> str:
     return " | ".join(parts).strip()
 
 
-def _apply_vin_decode_to_fields(case_id: str, decoded: dict) -> None:
-    """
-    Streamlit: para que los inputs se llenen, hay que escribir session_state
-    ANTES o en el evento (consult) sobre keys de inputs.
-    """
-    def set_if_empty(k: str, v: str) -> None:
-        if _safe(st.session_state.get(k, "")) == "":
-            st.session_state[k] = _safe(v)
-
-    set_if_empty(f"veh_brand_{case_id}", decoded.get("brand", ""))
-    set_if_empty(f"veh_model_{case_id}", decoded.get("model", ""))
-    set_if_empty(f"veh_year_{case_id}", decoded.get("year", ""))
-    set_if_empty(f"veh_trim_{case_id}", decoded.get("trim", ""))
-    set_if_empty(f"veh_engine_{case_id}", decoded.get("engine", ""))
-    set_if_empty(f"veh_vtype_{case_id}", decoded.get("vehicle_type", ""))
-    set_if_empty(f"veh_body_{case_id}", decoded.get("body_class", ""))
-    set_if_empty(f"veh_plant_{case_id}", decoded.get("plant_country", ""))
-    set_if_empty(f"veh_gvwr_{case_id}", decoded.get("gvwr", ""))
-
-
-def _reset_vehicle_form(case_id: str) -> None:
-    st.session_state[f"vin_text_{case_id}"] = ""
-    st.session_state[f"vin_decoded_{case_id}"] = {}
-    for k in [
-        f"veh_brand_{case_id}", f"veh_model_{case_id}", f"veh_year_{case_id}",
-        f"veh_trim_{case_id}", f"veh_engine_{case_id}", f"veh_vtype_{case_id}",
-        f"veh_body_{case_id}", f"veh_plant_{case_id}", f"veh_gvwr_{case_id}",
-        f"veh_weight_{case_id}", f"veh_desc_{case_id}",
-        f"vin_ok_{case_id}", f"veh_save_ok_{case_id}",
-    ]:
-        st.session_state[k] = "" if ("vin_ok" not in k and "veh_save_ok" not in k) else False
-
-
-def _get_case_snapshot(case_id: str) -> dict:
-    """
-    Cache ligero por caso en session_state para evitar re-llamar Sheets en cada render.
-    Se invalida poniendo st.session_state[f"_snap_dirty_{case_id}"]=True
-    """
-    snap_key = f"_snap_{case_id}"
-    dirty_key = f"_snap_dirty_{case_id}"
-    if st.session_state.get(snap_key) is None or st.session_state.get(dirty_key, True):
-        vdf = list_vehicles(case_id=case_id).fillna("")
-        adf = list_articles(case_id=case_id).fillna("")
-        ddf = list_documents(case_id).fillna("")
-        st.session_state[snap_key] = {"vdf": vdf, "adf": adf, "ddf": ddf}
-        st.session_state[dirty_key] = False
-    return st.session_state[snap_key]
-
-
-def _mark_snap_dirty(case_id: str) -> None:
-    st.session_state[f"_snap_dirty_{case_id}"] = True
-
-
 # ----------------------------
 # Tabs
 # ----------------------------
@@ -241,6 +263,7 @@ with tab_create:
             case_id_new = next_case_id(existing_ids, year=year)
 
             folder_name = f"{case_id_new} - {client_name}".strip()
+
             res = create_case_folder_via_script(case_id=case_id_new, folder_name=folder_name)
             drive_folder_id = res["folder_id"]
 
@@ -277,7 +300,7 @@ with tab_list:
             m.columns = ["client_id", "client_name"]
             df = df.merge(m, on="client_id", how="left")
 
-        show_cols = [c for c in ["case_id", "client_name", "status", "origin", "destination", "drive_folder_id", "created_at", "updated_at"] if c in df.columns]
+        show_cols = [c for c in ["case_id","client_name","status","origin","destination","drive_folder_id","created_at","updated_at"] if c in df.columns]
         st.dataframe(df[show_cols], use_container_width=True)
 
 
@@ -306,7 +329,7 @@ with tab_manage:
         st.info("Modo edición habilitado para trámites Pendiente/Enviado.")
     else:
         cases_for_manage = borradores
-        st.caption("Solo se muestran trámites en **Borrador**.")
+        st.caption("Solo se muestran trámites en **Borrador** (a menos que actives edición oficina).")
 
     if cases_for_manage.empty:
         st.warning("No hay trámites disponibles para gestionar con los filtros actuales.")
@@ -325,117 +348,113 @@ with tab_manage:
     drive_folder_id = str(case.get("drive_folder_id", ""))
     client_id = str(case.get("client_id", ""))
 
-    # client dict
-    client = {}
     client_name = ""
     if not clients_df.empty:
         m = clients_df[clients_df["client_id"].astype(str) == client_id]
         if not m.empty:
-            client = m.iloc[0].to_dict()
-            client_name = str(client.get("name", "")).strip()
+            client_name = str(m.iloc[0].get("name", "")).strip()
 
-    # Snapshot rápido (evita 10+ llamadas a Sheets por render)
-    snap = _get_case_snapshot(case_id)
-    vehicles_df = snap["vdf"]
-    articles_df = snap["adf"]
-    docs_df = snap["ddf"]
+    # Cargar data una sola vez (evita repetición y lentitud)
+    vehicles_df = list_vehicles(case_id=case_id).fillna("")
+    articles_df = list_articles(case_id=case_id).fillna("")
+    docs_df = list_documents(case_id).fillna("")
 
-    # ============================
-    # TARJETA RESUMEN (ARRIBA)
-    # ============================
-    st.markdown("### 🧾 Tarjeta del trámite")
-    a, b, c, d = st.columns([2.2, 1.1, 2.2, 1.5])
-    with a:
-        st.markdown(f"**Cliente:** {client_name}")
-        st.markdown(f"**Trámite:** {case_id}")
-    with b:
-        st.markdown("**Estatus**")
-        st.info(case_status or "-", icon="📌")
-    with c:
-        st.markdown("**Carpeta Drive**")
-        st.code(drive_folder_id or "(sin carpeta)", language="text")
-    with d:
-        st.markdown("**Totales**")
-        st.metric("Vehículos", 0 if vehicles_df.empty else len(vehicles_df))
-        st.metric("Artículos", 0 if articles_df.empty else len(articles_df))
-        st.metric("Docs", 0 if docs_df.empty else len(docs_df))
+    # ---------------------------------------------------------
+    # TARJETA EJECUTIVA (CORPORATIVO/ADUANA) + KPI
+    # ---------------------------------------------------------
+    with st.container():
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        topL, topR = st.columns([3, 2])
+
+        with topL:
+            st.markdown(f"### {client_name or '(Sin cliente)'}")
+            st.markdown(f"**{case_id}**")
+            origin = str(case.get("origin", "")).strip()
+            destination = str(case.get("destination", "")).strip()
+            created_at = str(case.get("created_at", "")).strip()
+            line = " | ".join([x for x in [f"Origen: {origin}" if origin else "", f"Destino: {destination}" if destination else "", f"Creado: {created_at}" if created_at else ""] if x])
+            if line:
+                st.markdown(f"<p class='muted'>{line}</p>", unsafe_allow_html=True)
+
+        with topR:
+            st.markdown("**Estatus**")
+            st.markdown(_status_badge(case_status), unsafe_allow_html=True)
+            url = _drive_folder_url(drive_folder_id)
+            st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+            st.markdown("**Carpeta Drive**")
+            if url:
+                st.link_button("Abrir carpeta", url)
+            else:
+                st.caption("(sin carpeta)")
+
+        k1, k2, k3 = st.columns(3)
+        with k1:
+            st.markdown(f"<div class='kpi'><div class='label'>Vehículos</div><div class='value'>{0 if vehicles_df.empty else len(vehicles_df)}</div></div>", unsafe_allow_html=True)
+        with k2:
+            st.markdown(f"<div class='kpi'><div class='label'>Artículos</div><div class='value'>{0 if articles_df.empty else len(articles_df)}</div></div>", unsafe_allow_html=True)
+        with k3:
+            st.markdown(f"<div class='kpi'><div class='label'>Documentos</div><div class='value'>{0 if docs_df.empty else len(docs_df)}</div></div>", unsafe_allow_html=True)
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("<div class='section-title'>Resumen completo (registros actuales)</div>", unsafe_allow_html=True)
+
+    # -------------------------
+    # RESUMEN EN TABLAS (claro, ejecutivo)
+    # -------------------------
+    # Vehículos
+    st.markdown("#### Vehículos")
+    if vehicles_df.empty:
+        st.info("Sin vehículos.")
+    else:
+        v = vehicles_df.copy().fillna("").reset_index(drop=True)
+        v.insert(0, "#", range(1, len(v) + 1))
+        cols = [c for c in ["#", "vin", "brand", "model", "year", "trim", "engine", "vehicle_type", "body_class", "plant_country", "gvwr", "weight", "description", "created_at"] if c in v.columns]
+        st.dataframe(v[cols], use_container_width=True, hide_index=True)
+
+    # Artículos
+    st.markdown("#### Artículos")
+    if articles_df.empty:
+        st.info("Sin artículos.")
+    else:
+        a = articles_df.copy().fillna("").reset_index(drop=True)
+        a.insert(0, "#", range(1, len(a) + 1))
+        # Para aduana: no repetir todo, la descripción ya manda
+        cols = [c for c in ["#", "seq", "description", "quantity", "weight", "value", "is_vehicle_part", "parent_vin", "created_at"] if c in a.columns]
+        st.dataframe(a[cols], use_container_width=True, hide_index=True)
+
+    # Documentos
+    st.markdown("#### Documentos")
+    if docs_df.empty:
+        st.info("Sin documentos.")
+    else:
+        d = docs_df.copy().fillna("").reset_index(drop=True)
+        d.insert(0, "#", range(1, len(d) + 1))
+        cols = [c for c in ["#", "doc_type", "file_name", "uploaded_at"] if c in d.columns]
+        st.dataframe(d[cols], use_container_width=True, hide_index=True)
 
     st.divider()
 
-    # ============================
-    # RESUMEN COMPLETO (FUERA DE ACORDEONES) EN TABLAS
-    # ============================
-    st.markdown("### 📌 Resumen completo (registros actuales)")
+    # =========================================================
+    # ACORDEONES OPERATIVOS (se mantienen)
+    # =========================================================
+    with st.expander("🚗 Vehículos (agregar / ver)", expanded=True):
+        st.caption("Pega o dicta el VIN. Consulta y luego guarda.")
 
-    colv, cola, cold = st.columns(3)
+        # Nonce para reset seguro (evita StreamlitAPIException)
+        vin_nonce_key = f"vin_nonce_{case_id}"
+        if vin_nonce_key not in st.session_state:
+            st.session_state[vin_nonce_key] = 0
 
-    with colv:
-        st.markdown("#### 🚗 Vehículos (tabla)")
-        if vehicles_df.empty:
-            st.info("Aún no hay vehículos.")
-        else:
-            vshow = vehicles_df.copy().fillna("").reset_index(drop=True)
-            # tabla amigable
-            keep = [c for c in ["vin","brand","model","year","trim","engine","vehicle_type","body_class","plant_country","gvwr","weight","description","created_at"] if c in vshow.columns]
-            vshow = vshow[keep]
-            vshow.insert(0, "No.", range(1, len(vshow)+1))
-            st.dataframe(vshow, use_container_width=True, height=280)
-
-    with cola:
-        st.markdown("#### 📦 Artículos (tabla)")
-        if articles_df.empty:
-            st.info("Aún no hay artículos.")
-        else:
-            ashow = articles_df.copy().fillna("").reset_index(drop=True)
-            keep = [c for c in ["seq","item_type","ref","brand","model","weight","condition","quantity","value","is_vehicle_part","parent_vin","description","created_at"] if c in ashow.columns]
-            ashow = ashow[keep]
-            ashow.insert(0, "No.", range(1, len(ashow)+1))
-            st.dataframe(ashow, use_container_width=True, height=280)
-
-    with cold:
-        st.markdown("#### 📎 Documentos (tabla)")
-        if docs_df.empty:
-            st.info("Aún no hay documentos.")
-        else:
-            dshow = docs_df.copy().fillna("").reset_index(drop=True)
-            keep = [c for c in ["doc_type","file_name","uploaded_at","drive_file_id"] if c in dshow.columns]
-            dshow = dshow[keep]
-            dshow.insert(0, "No.", range(1, len(dshow)+1))
-            st.dataframe(dshow, use_container_width=True, height=280)
-
-    st.divider()
-
-    # ============================
-    # ACORDEONES: SOLO PARA CAPTURA
-    # ============================
-    with st.expander("🚗 Vehículos (agregar)", expanded=True):
-        vin_text_key = f"vin_text_{case_id}"
+        vin_text_key = f"vin_text_{case_id}_{st.session_state[vin_nonce_key]}"
         vin_decoded_key = f"vin_decoded_{case_id}"
-        reset_flag_key = f"veh_reset_{case_id}"
 
-        # reset seguro ANTES de instanciar widgets
-        if st.session_state.get(reset_flag_key, False):
-            _reset_vehicle_form(case_id)
-            st.session_state[reset_flag_key] = False
-
-        st.session_state.setdefault(vin_text_key, "")
-        st.session_state.setdefault(vin_decoded_key, {})
-
-        for k in [
-            f"veh_brand_{case_id}", f"veh_model_{case_id}", f"veh_year_{case_id}",
-            f"veh_trim_{case_id}", f"veh_engine_{case_id}", f"veh_vtype_{case_id}",
-            f"veh_body_{case_id}", f"veh_plant_{case_id}", f"veh_gvwr_{case_id}",
-            f"veh_weight_{case_id}", f"veh_desc_{case_id}",
-        ]:
-            st.session_state.setdefault(k, "")
-
-        st.caption("Pega/dicta VIN. Consulta. Revisa campos. Guarda.")
         vin_text = st.text_input("VIN", key=vin_text_key)
         vin_norm = normalize_vin(vin_text)
 
         colA, colB = st.columns([1, 2])
         with colA:
-            confirm_vin = st.checkbox("✅ Confirmo que el VIN es correcto", key=f"vin_ok_{case_id}")
+            confirm_vin = st.checkbox("Confirmo que el VIN es correcto", key=f"vin_ok_{case_id}")
         with colB:
             consult_btn = st.button(
                 "Consultar información del vehículo",
@@ -450,8 +469,22 @@ with tab_manage:
                 st.session_state[vin_decoded_key] = {}
             else:
                 st.session_state[vin_decoded_key] = out
-                _apply_vin_decode_to_fields(case_id, out)
-                st.success("✅ Info consultada y aplicada a campos.")
+
+                # ✅ Autollenado REAL: escribir en session_state de los widgets
+                st.session_state[f"veh_brand_{case_id}"] = str(out.get("brand", "") or "")
+                st.session_state[f"veh_model_{case_id}"] = str(out.get("model", "") or "")
+                st.session_state[f"veh_year_{case_id}"] = str(out.get("year", "") or "")
+                st.session_state[f"veh_trim_{case_id}"] = str(out.get("trim", "") or "")
+                st.session_state[f"veh_engine_{case_id}"] = str(out.get("engine", "") or "")
+                st.session_state[f"veh_vtype_{case_id}"] = str(out.get("vehicle_type", "") or "")
+                st.session_state[f"veh_body_{case_id}"] = str(out.get("body_class", "") or "")
+                st.session_state[f"veh_plant_{case_id}"] = str(out.get("plant_country", "") or "")
+                st.session_state[f"veh_gvwr_{case_id}"] = str(out.get("gvwr", "") or "")
+
+                # Nota: curb_weight lo guardamos internamente si viene, pero NO lo mostramos
+                st.session_state[f"veh_curb_hidden_{case_id}"] = str(out.get("curb_weight", "") or "")
+
+                st.success("Info consultada. Verifica y guarda.")
 
         decoded = st.session_state.get(vin_decoded_key, {}) or {}
         with st.expander("🧪 Debug decoder", expanded=False):
@@ -481,15 +514,13 @@ with tab_manage:
         with c9:
             gvwr = st.text_input("GVWR (opcional)", key=f"veh_gvwr_{case_id}")
 
-        c10, c11 = st.columns(2)
-        with c10:
-            weight_opt = st.text_input("Peso (opcional)", key=f"veh_weight_{case_id}")
-        with c11:
-            st.caption("Curb weight fue removido (usamos GVWR/Peso).")
+        # ✅ Quitamos curb weight (no UI)
+        curb_weight_hidden = str(st.session_state.get(f"veh_curb_hidden_{case_id}", "") or "")
 
-        description = st.text_area("Descripción (opcional)", height=60, key=f"veh_desc_{case_id}")
+        weight_opt = st.text_input("Peso (opcional)", value="", key=f"veh_weight_{case_id}")
+        description = st.text_area("Descripción (opcional)", value="", height=60, key=f"veh_desc_{case_id}")
 
-        save_ok = st.checkbox("✅ Confirmo que VIN + datos están listos para guardar", key=f"veh_save_ok_{case_id}")
+        save_ok = st.checkbox("Confirmo que VIN + datos están listos para guardar", key=f"veh_save_ok_{case_id}")
 
         if st.button("Guardar vehículo", type="primary", disabled=not save_ok, key=f"save_vehicle_{case_id}"):
             try:
@@ -508,22 +539,33 @@ with tab_manage:
                     body_class=body_class,
                     plant_country=plant_country,
                     gvwr=gvwr,
-                    curb_weight="",        # ✅ ya no se usa en UI
+                    curb_weight=curb_weight_hidden,  # se guarda si existe, pero no se muestra
                     weight=weight_opt,
                     value="0",
                     description=description,
-                    source="ui_form",
+                    source="vin_text",
                 )
 
-                st.success("✅ Vehículo guardado correctamente.")
-                _mark_snap_dirty(case_id)               # ✅ refresca tablas resumen
-                st.session_state[reset_flag_key] = True # ✅ limpia formulario en siguiente run
-                st.rerun()
+                st.success("Vehículo guardado correctamente.")
 
+                # ✅ Reset seguro: sube nonce para que el input VIN sea “nuevo”
+                st.session_state[vin_nonce_key] = int(st.session_state[vin_nonce_key]) + 1
+                st.session_state[vin_decoded_key] = {}
+                st.rerun()
             except Exception as e:
                 st.error(f"Error guardando vehículo: {type(e).__name__}: {e}")
 
-    with st.expander("📦 Artículos (agregar)", expanded=True):
+        st.markdown("#### Vehículos registrados")
+        vehicles_df2 = list_vehicles(case_id=case_id).fillna("")
+        if vehicles_df2.empty:
+            st.info("Aún no hay vehículos.")
+        else:
+            vshow = vehicles_df2.copy().reset_index(drop=True)
+            vshow.insert(0, "#", range(1, len(vshow) + 1))
+            show_cols = [c for c in ["#", "vin", "brand", "model", "year", "gvwr", "weight", "created_at"] if c in vshow.columns]
+            st.dataframe(vshow[show_cols], use_container_width=True, hide_index=True)
+
+    with st.expander("📦 Artículos (agregar / ver)", expanded=True):
         st.caption("Dicta en formato continuo. Ejemplo:")
         st.code("tipo lavadora ref 440827 marca Sienna modelo Sleep4415 peso 95 lb estado usado cantidad 1 valor 120 parte_vehiculo no", language="text")
 
@@ -544,7 +586,7 @@ with tab_manage:
             st.session_state[f"av_{case_id}"] = parsed.get("value", "") or ""
             st.session_state[f"ap_{case_id}"] = bool(parsed.get("is_vehicle_part", False))
             st.session_state[f"pv_{case_id}"] = normalize_vin(parsed.get("parent_vin", "") or "")
-            st.success("✅ Dictado aplicado.")
+            st.success("Dictado aplicado.")
 
         with st.expander("🧪 Debug dictado", expanded=False):
             st.json(parsed)
@@ -574,16 +616,15 @@ with tab_manage:
         is_part = st.checkbox("¿Es parte del vehículo?", key=f"ap_{case_id}")
         parent_vin = ""
         if is_part:
-            vdf_now = _get_case_snapshot(case_id)["vdf"]
             vins = []
-            if not vdf_now.empty and "vin" in vdf_now.columns:
-                vins = [x for x in vdf_now["vin"].tolist() if x]
+            vdf = list_vehicles(case_id=case_id).fillna("")
+            if not vdf.empty and "vin" in vdf.columns:
+                vins = [x for x in vdf["vin"].tolist() if x]
             if vins:
                 parent_vin = st.selectbox("VIN del vehículo al que pertenece", vins, key=f"pv_sel_{case_id}")
             else:
                 parent_vin = st.text_input("VIN (si no hay vehículos aún)", key=f"pv_{case_id}")
 
-        # ✅ descripción SIEMPRE viva (sin key que la congele)
         d = {
             "type": item_type, "ref": ref, "brand": brand, "model": model,
             "weight": weight, "condition": condition, "quantity": int(quantity),
@@ -591,10 +632,10 @@ with tab_manage:
         }
         desc_preview = _build_article_description(d)
 
-        st.markdown("**Descripción (automática):**")
-        st.code(desc_preview or "(sin descripción)", language="text")
+        # ✅ Visible siempre
+        st.text_area("Descripción (automática)", value=desc_preview, height=80, disabled=True)
 
-        ok = st.checkbox("✅ Confirmo que el artículo está correcto antes de guardar", key=f"art_ok_{case_id}")
+        ok = st.checkbox("Confirmo que el artículo está correcto antes de guardar", key=f"art_ok_{case_id}")
         if st.button("Guardar artículo", type="primary", disabled=not ok, key=f"save_art_{case_id}"):
             try:
                 add_article(
@@ -609,22 +650,37 @@ with tab_manage:
                     value=value,
                     is_vehicle_part=bool(is_part),
                     parent_vin=parent_vin,
-                    description=desc_preview,  # ✅ se guarda lo automático
+                    description=desc_preview,
                     source="voice" if _safe(dictation) else "manual",
                 )
-                st.success("✅ Artículo guardado correctamente.")
-                _mark_snap_dirty(case_id)
-                # limpieza simple
+                st.success("Artículo guardado correctamente.")
+
                 st.session_state[dict_key] = ""
-                for k in [f"at_{case_id}", f"ar_{case_id}", f"ab_{case_id}", f"am_{case_id}", f"aw_{case_id}", f"ac_{case_id}", f"av_{case_id}", f"pv_{case_id}"]:
-                    st.session_state[k] = ""
+                st.session_state[f"at_{case_id}"] = ""
+                st.session_state[f"ar_{case_id}"] = ""
+                st.session_state[f"ab_{case_id}"] = ""
+                st.session_state[f"am_{case_id}"] = ""
+                st.session_state[f"aw_{case_id}"] = ""
+                st.session_state[f"ac_{case_id}"] = ""
                 st.session_state[f"aq_{case_id}"] = 1
+                st.session_state[f"av_{case_id}"] = ""
                 st.session_state[f"ap_{case_id}"] = False
+                st.session_state[f"pv_{case_id}"] = ""
                 st.rerun()
             except Exception as e:
                 st.error(f"Error guardando artículo: {type(e).__name__}: {e}")
 
-    with st.expander("📎 Documentos del trámite", expanded=True):
+        st.markdown("#### Artículos registrados")
+        adf2 = list_articles(case_id=case_id).fillna("")
+        if adf2.empty:
+            st.info("Aún no hay artículos.")
+        else:
+            ashow = adf2.copy().reset_index(drop=True)
+            ashow.insert(0, "#", range(1, len(ashow) + 1))
+            show_cols = [c for c in ["#", "seq", "description", "quantity", "weight", "value", "created_at"] if c in ashow.columns]
+            st.dataframe(ashow[show_cols], use_container_width=True, hide_index=True)
+
+    with st.expander("📎 Documentos del trámite (subir TODO aquí)", expanded=True):
         if not drive_folder_id:
             st.warning("Este trámite todavía no tiene carpeta en Drive.")
         else:
@@ -661,23 +717,35 @@ with tab_manage:
                             doc_type=doc_type,
                         )
 
-                    st.success(f"✅ {len(files)} archivo(s) subido(s) y registrado(s).")
-                    _mark_snap_dirty(case_id)
+                    st.success(f"{len(files)} archivo(s) subido(s) y registrado(s).")
                     st.rerun()
                 except Exception as e:
                     st.error(f"Error subiendo documentos: {type(e).__name__}: {e}")
 
+        st.markdown("#### Documentos registrados")
+        ddf = list_documents(case_id).fillna("")
+        if ddf.empty:
+            st.info("Aún no hay documentos.")
+        else:
+            dshow = ddf.copy().reset_index(drop=True)
+            dshow.insert(0, "#", range(1, len(dshow) + 1))
+            show_cols = [c for c in ["#", "doc_type", "file_name", "uploaded_at"] if c in dshow.columns]
+            st.dataframe(dshow[show_cols], use_container_width=True, hide_index=True)
+
+    # (Validación + PDF + status) se mantiene igual por ahora (NO tocamos PDF)
     with st.expander("✅ Validación + Generar PDF + Marcar Pendiente", expanded=True):
-        snap2 = _get_case_snapshot(case_id)
-        vdf = snap2["vdf"]
-        adf = snap2["adf"]
-        ddf = snap2["ddf"]
+        st.caption("Cuando todo esté completo (vehículos + artículos + documentos), genera el PDF y marca Pendiente.")
+
+        vdf = list_vehicles(case_id=case_id).fillna("")
+        adf = list_articles(case_id=case_id).fillna("")
+        ddf = list_documents(case_id).fillna("")
 
         st.write(f"- Vehículos: {'✅' if not vdf.empty else '❌'}")
         st.write(f"- Artículos: {'✅' if not adf.empty else '❌'}")
         st.write(f"- Documentos: {'✅' if not ddf.empty else '❌'}")
 
         ready = st.checkbox("Confirmo que el trámite está completo y listo para enviar", key=f"ready_{case_id}")
+
         can_generate = ready and (not vdf.empty) and (not adf.empty) and (not ddf.empty) and bool(drive_folder_id)
 
         pdf_name = f"TR_{case_id}_{client_name}_RESUMEN_TRAMITE.pdf".replace(" ", "_")
@@ -687,7 +755,7 @@ with tab_manage:
                 case_row = get_case(case_id) or {}
                 pdf_bytes = build_case_summary_pdf_bytes(
                     case=case_row,
-                    client=client or {"name": client_name},
+                    client_name=client_name,
                     vehicles_df=vdf,
                     articles_df=adf,
                     documents_df=ddf,
@@ -709,8 +777,7 @@ with tab_manage:
 
                 update_case_fields(case_id, {"status": "Pendiente", "updated_at": datetime.now().isoformat(timespec="seconds")})
 
-                st.success("✅ PDF generado + guardado en Drive y trámite marcado como Pendiente.")
-                _mark_snap_dirty(case_id)
+                st.success("PDF generado + guardado en Drive y trámite marcado como Pendiente.")
                 st.rerun()
 
             except Exception as e:
