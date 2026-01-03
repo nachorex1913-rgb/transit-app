@@ -16,18 +16,26 @@ from .validators import is_valid_vin, normalize_vin
 
 
 SHEETS = {
-    "clients": ["client_id","name","address","id_type","id_number","phone","email","country_destination","created_at","updated_at"],
-    # ✅ se agrega case_name
-    "cases": ["case_id","client_id","case_name","case_date","status","origin","destination","notes","drive_folder_id","created_at","updated_at","final_pdf_drive_id","final_pdf_uploaded_at"],
-    # ✅ se agregan campos extra SOLO para vehicle (quedan vacíos en article)
+    "clients": [
+        "client_id","name","address","id_type","id_number","phone","email","country_destination","created_at","updated_at"
+    ],
+    "cases": [
+        "case_id","client_id","case_date","status","origin","destination","notes","drive_folder_id",
+        "created_at","updated_at","final_pdf_drive_id","final_pdf_uploaded_at"
+    ],
+    # ✅ NUEVO: case_seq + campos extra de vehículo
     "items": [
-        "item_id","case_id","item_type","unique_key",
+        "item_id","case_id","case_seq","item_type","unique_key",
         "brand","model","year",
         "trim","engine","vehicle_type","body_class","plant_country","gvwr","curb_weight",
         "description","quantity","weight","value","source","created_at"
     ],
-    "documents": ["doc_id","case_id","item_id","doc_type","drive_file_id","file_name","uploaded_at"],
-    "audit_log": ["log_id","timestamp","user","action","entity","entity_id","details"],
+    "documents": [
+        "doc_id","case_id","item_id","doc_type","drive_file_id","file_name","uploaded_at"
+    ],
+    "audit_log": [
+        "log_id","timestamp","user","action","entity","entity_id","details"
+    ],
     "oauth_tokens": ["key","value"],
 }
 
@@ -221,6 +229,7 @@ def upsert_client(
     now = _now_iso()
     headers = SHEETS["clients"]
 
+    # Update
     if client_id:
         for i, r in enumerate(records, start=2):
             if str(r.get("client_id","")) == client_id:
@@ -239,6 +248,7 @@ def upsert_client(
                 _update_row_by_headers(ws, i, headers, updated)
                 return client_id
 
+    # Insert
     max_n = 0
     for r in records:
         cid = str(r.get("client_id","")).strip()
@@ -261,7 +271,6 @@ def list_cases() -> pd.DataFrame:
 
 def create_case(
     client_id: str,
-    case_name: str,
     origin: str = "USA",
     destination: str = "",
     notes: str = "",
@@ -280,8 +289,7 @@ def create_case(
     cdate = case_date or datetime.now().date().isoformat()
 
     row = [
-        case_id, client_id, case_name, cdate, status,
-        origin, destination, notes, drive_folder_id or "",
+        case_id, client_id, cdate, status, origin, destination, notes, drive_folder_id or "",
         now, now, "", ""
     ]
     _append("cases", row)
@@ -336,6 +344,18 @@ def list_items(case_id: Optional[str] = None) -> pd.DataFrame:
     return df
 
 
+def _next_case_seq(case_id: str) -> int:
+    rows = _get_all_records("items")
+    mx = 0
+    for r in rows:
+        if str(r.get("case_id","")) == str(case_id):
+            try:
+                mx = max(mx, int(r.get("case_seq") or 0))
+            except Exception:
+                pass
+    return mx + 1
+
+
 def _vin_exists_global(vin: str) -> bool:
     v = normalize_vin(vin)
     for r in _get_all_records("items"):
@@ -354,7 +374,7 @@ def add_vehicle_item(
     weight: str = "",
     value: str = "0",
     source: str = "manual",
-    # ✅ extra NHTSA (solo vehículos)
+    # ✅ extras
     trim: str = "",
     engine: str = "",
     vehicle_type: str = "",
@@ -375,9 +395,10 @@ def add_vehicle_item(
     item_id = next_item_id(existing_item_ids)
     now = _now_iso()
 
-    # quantity en vehículos SIEMPRE 1
+    case_seq = _next_case_seq(case_id)
+
     row = [
-        item_id, case_id, "vehicle", v,
+        item_id, case_id, case_seq, "vehicle", v,
         brand, model, year,
         trim, engine, vehicle_type, body_class, plant_country, gvwr, curb_weight,
         description, 1, weight, value, source, now
@@ -388,6 +409,7 @@ def add_vehicle_item(
 
 def add_article_item(
     case_id: str,
+    unique_key: str,
     description: str,
     brand: str = "",
     model: str = "",
@@ -396,20 +418,20 @@ def add_article_item(
     value: str = "",
     source: str = "manual",
 ) -> str:
+    """
+    ✅ Nota: el unique_key lo genera el caller (A-CASEID-0001) por trámite
+    """
     init_db()
     items_ws = _ws("items")
     records = items_ws.get_all_records()
     existing_item_ids = [r.get("item_id","") for r in records]
-    existing_keys = [r.get("unique_key","") for r in records if str(r.get("case_id","")) == case_id]
 
     item_id = next_item_id(existing_item_ids)
-    # ✅ secuencia por TRÁMITE (no global)
-    seq = next_article_seq(existing_keys, case_id=case_id)
     now = _now_iso()
+    case_seq = _next_case_seq(case_id)
 
-    # Campos extra vehicle se dejan vacíos en articles
     row = [
-        item_id, case_id, "article", seq,
+        item_id, case_id, case_seq, "article", unique_key,
         brand, model, "",
         "", "", "", "", "", "", "",
         description, int(quantity or 1), weight, value, source, now
