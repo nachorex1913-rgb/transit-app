@@ -14,19 +14,22 @@ import random
 from .ids import next_case_id, next_vehicle_id, next_article_id, next_doc_id
 from .validators import is_valid_vin, normalize_vin
 
+# ✅ Import del decoder para que el guardado no dependa del UI/handler
+from .vin_decode import decode_vin
+
 
 SHEETS = {
     "clients": ["client_id","name","address","id_type","id_number","phone","email","country_destination","created_at","updated_at"],
     "cases": ["case_id","client_id","case_date","status","origin","destination","notes","drive_folder_id","created_at","updated_at","final_pdf_drive_id","final_pdf_uploaded_at"],
 
-    # ✅ NUEVO: VEHICLES (solo vehículos)
+    # ✅ VEHICLES (solo vehículos)
     "vehicles": [
         "vehicle_id","case_id","vin","brand","model","year",
         "trim","engine","vehicle_type","body_class","plant_country",
         "gvwr","curb_weight","weight","value","description","source","created_at"
     ],
 
-    # ✅ NUEVO: ARTICLES (solo artículos)
+    # ✅ ARTICLES (solo artículos)
     "articles": [
         "article_id","case_id","seq",
         "item_type","ref","brand","model",
@@ -45,6 +48,10 @@ DEFAULT_STATUS = "Borrador"
 
 def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def _clean(x: Any) -> str:
+    return ("" if x is None else str(x)).strip()
 
 
 @st.cache_resource
@@ -365,12 +372,46 @@ def add_vehicle(
     description: str = "",
     source: str = "vin_text",
 ) -> str:
+    """
+    ✅ Cambio clave:
+    - Si vienen vacíos brand/model/year/etc, decodifica VIN aquí mismo y llena campos antes de guardar.
+    - Así no dependemos de que el UI/handler pase los campos.
+    """
     init_db()
     v = normalize_vin(vin)
     if not is_valid_vin(v) or len(v) != 17:
         raise ValueError("VIN inválido. Debe tener 17 caracteres y no incluir I/O/Q.")
     if _vin_exists_global(v):
         raise ValueError("Este VIN ya existe en el sistema (no se puede duplicar).")
+
+    # 1) si faltan campos, intenta decode
+    needs_decode = not any([
+        _clean(brand), _clean(model), _clean(year),
+        _clean(trim), _clean(engine), _clean(vehicle_type),
+        _clean(body_class), _clean(plant_country),
+        _clean(gvwr), _clean(curb_weight),
+    ])
+
+    decoded: Dict[str, Any] = {}
+    if needs_decode:
+        decoded = decode_vin(v) or {}
+
+        # Solo llenamos si decoded trae algo útil
+        if decoded.get("source") == "nhtsa" or decoded.get("brand") or decoded.get("model") or decoded.get("year"):
+            brand = _clean(brand) or _clean(decoded.get("brand"))
+            model = _clean(model) or _clean(decoded.get("model"))
+            year = _clean(year) or _clean(decoded.get("year"))
+            trim = _clean(trim) or _clean(decoded.get("trim"))
+            engine = _clean(engine) or _clean(decoded.get("engine"))
+            vehicle_type = _clean(vehicle_type) or _clean(decoded.get("vehicle_type"))
+            body_class = _clean(body_class) or _clean(decoded.get("body_class"))
+            plant_country = _clean(plant_country) or _clean(decoded.get("plant_country"))
+            gvwr = _clean(gvwr) or _clean(decoded.get("gvwr"))
+            curb_weight = _clean(curb_weight) or _clean(decoded.get("curb_weight"))
+
+            # Fuente: respeta si caller manda una fuente específica, si no usa la del decoder
+            if source in ("vin_text", "", None):
+                source = _clean(decoded.get("source")) or "vin_text"
 
     ws = _ws("vehicles")
     records = ws.get_all_records()
@@ -379,9 +420,12 @@ def add_vehicle(
     now = _now_iso()
 
     row = [
-        vehicle_id, case_id, v, brand, model, year,
-        trim, engine, vehicle_type, body_class, plant_country,
-        gvwr, curb_weight, weight, value, description, source, now
+        vehicle_id, case_id, v,
+        _clean(brand), _clean(model), _clean(year),
+        _clean(trim), _clean(engine), _clean(vehicle_type), _clean(body_class), _clean(plant_country),
+        _clean(gvwr), _clean(curb_weight),
+        _clean(weight), _clean(value), _clean(description),
+        _clean(source), now
     ]
     _append("vehicles", row)
     return vehicle_id
@@ -404,7 +448,6 @@ def _next_seq_for_case(case_id: str) -> str:
     ws = _ws("articles")
     records = ws.get_all_records()
     seqs = [r.get("seq","") for r in records if str(r.get("case_id","")) == case_id]
-    # seq = A-<CASE_ID>-0001
     mx = 0
     for s in seqs:
         s = str(s).strip()
