@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional, Any, Dict
+from typing import Optional, Any
 
 import pandas as pd
 import gspread
@@ -14,22 +14,15 @@ import random
 from .ids import next_case_id, next_vehicle_id, next_article_id, next_doc_id
 from .validators import is_valid_vin, normalize_vin
 
-# ✅ Import del decoder para que el guardado no dependa del UI/handler
-from .vin_decode import decode_vin
-
 
 SHEETS = {
     "clients": ["client_id","name","address","id_type","id_number","phone","email","country_destination","created_at","updated_at"],
     "cases": ["case_id","client_id","case_date","status","origin","destination","notes","drive_folder_id","created_at","updated_at","final_pdf_drive_id","final_pdf_uploaded_at"],
-
-    # ✅ VEHICLES (solo vehículos)
     "vehicles": [
         "vehicle_id","case_id","vin","brand","model","year",
         "trim","engine","vehicle_type","body_class","plant_country",
         "gvwr","curb_weight","weight","value","description","source","created_at"
     ],
-
-    # ✅ ARTICLES (solo artículos)
     "articles": [
         "article_id","case_id","seq",
         "item_type","ref","brand","model",
@@ -37,7 +30,6 @@ SHEETS = {
         "is_vehicle_part","parent_vin",
         "description","source","created_at"
     ],
-
     "documents": ["doc_id","case_id","doc_type","drive_file_id","file_name","uploaded_at"],
     "audit_log": ["log_id","timestamp","user","action","entity","entity_id","details"],
     "oauth_tokens": ["key","value"],
@@ -48,10 +40,6 @@ DEFAULT_STATUS = "Borrador"
 
 def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
-
-
-def _clean(x: Any) -> str:
-    return ("" if x is None else str(x)).strip()
 
 
 @st.cache_resource
@@ -155,7 +143,23 @@ def _ws(tab: str) -> gspread.Worksheet:
     return wmap[tab]
 
 
-def _get_all_records(tab: str) -> list[dict[str, Any]]:
+# -----------------------------
+# Cache de lecturas con invalidación por "rev"
+# -----------------------------
+def _rev_key(tab: str) -> str:
+    return f"_db_rev_{tab}"
+
+
+def _get_rev(tab: str) -> int:
+    return int(st.session_state.get(_rev_key(tab), 0))
+
+
+def _bump_rev(tab: str) -> None:
+    st.session_state[_rev_key(tab)] = _get_rev(tab) + 1
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_all_records(tab: str, rev: int) -> list[dict[str, Any]]:
     ws = _ws(tab)
     last_err = None
     for attempt in range(6):
@@ -168,12 +172,17 @@ def _get_all_records(tab: str) -> list[dict[str, Any]]:
     raise RuntimeError(f"Error leyendo tab '{tab}'. Headers: {header}. Detalle: {last_err}") from last_err
 
 
+def _get_all_records(tab: str) -> list[dict[str, Any]]:
+    return _cached_all_records(tab, _get_rev(tab))
+
+
 def _append(tab: str, row: list[Any]) -> None:
     ws = _ws(tab)
     last_err = None
     for attempt in range(6):
         try:
             ws.append_row(row, value_input_option="USER_ENTERED")
+            _bump_rev(tab)  # invalida cache
             return
         except gspread.exceptions.APIError as e:
             last_err = e
@@ -187,11 +196,6 @@ def _col_letter(n: int) -> str:
         n, r = divmod(n - 1, 26)
         s = chr(65 + r) + s
     return s
-
-
-def _update_row_by_headers(ws: gspread.Worksheet, row_index: int, headers: list[str], record: dict[str, Any]):
-    end_col = _col_letter(len(headers))
-    ws.update(f"A{row_index}:{end_col}{row_index}", [[record.get(h, "") for h in headers]])
 
 
 # -----------------------------
@@ -208,63 +212,6 @@ def get_client(client_id: str) -> dict[str, Any] | None:
         if str(r.get("client_id","")) == str(client_id):
             return r
     return None
-
-
-def search_clients(query: str) -> pd.DataFrame:
-    df = list_clients()
-    if df.empty:
-        return df
-    q = (query or "").strip().lower()
-    if not q:
-        return df
-    mask = df.apply(lambda r: q in str(r.to_dict()).lower(), axis=1)
-    return df[mask]
-
-
-def upsert_client(
-    name: str,
-    address: str = "",
-    id_type: str = "",
-    id_number: str = "",
-    phone: str = "",
-    email: str = "",
-    country_destination: str = "",
-    client_id: Optional[str] = None,
-) -> str:
-    init_db()
-    ws = _ws("clients")
-    records = ws.get_all_records()
-    now = _now_iso()
-    headers = SHEETS["clients"]
-
-    if client_id:
-        for i, r in enumerate(records, start=2):
-            if str(r.get("client_id","")) == client_id:
-                updated = {
-                    "client_id": client_id,
-                    "name": name,
-                    "address": address,
-                    "id_type": id_type,
-                    "id_number": id_number,
-                    "phone": phone,
-                    "email": email,
-                    "country_destination": country_destination,
-                    "created_at": r.get("created_at") or now,
-                    "updated_at": now,
-                }
-                _update_row_by_headers(ws, i, headers, updated)
-                return client_id
-
-    max_n = 0
-    for r in records:
-        cid = str(r.get("client_id","")).strip()
-        if cid.startswith("CL-") and cid[3:].isdigit():
-            max_n = max(max_n, int(cid[3:]))
-
-    new_id = f"CL-{max_n+1:06d}"
-    row = [new_id, name, address, id_type, id_number, phone, email, country_destination, now, now]
-    _append("clients", row)
-    return new_id
 
 
 # -----------------------------
@@ -308,6 +255,11 @@ def get_case(case_id: str) -> dict[str, Any] | None:
 
 
 def update_case_fields(case_id: str, fields: dict) -> None:
+    """
+    FIX robusto:
+    - NO usa ws.find() (frágil)
+    - Busca el case_id leyendo toda la columna case_id y calcula row exacto.
+    """
     init_db()
     ws = _ws("cases")
     headers = _safe_get_row1(ws)
@@ -315,22 +267,33 @@ def update_case_fields(case_id: str, fields: dict) -> None:
         raise RuntimeError("La hoja 'cases' no tiene columna case_id.")
 
     col_case_id = headers.index("case_id") + 1
-    cell = ws.find(case_id, in_column=col_case_id)
-    if not cell:
-        raise ValueError(f"case_id no encontrado: {case_id}")
-    row = cell.row
+
+    # ✅ row lookup robusto
+    col_vals = ws.col_values(col_case_id)  # incluye header
+    target = str(case_id).strip()
+    row_idx = None
+    for i, v in enumerate(col_vals, start=1):
+        if i == 1:
+            continue  # header
+        if str(v).strip() == target:
+            row_idx = i
+            break
+
+    if row_idx is None:
+        raise ValueError(f"case_id no encontrado en sheet: {case_id}")
 
     updates = []
-    for k, v in fields.items():
+    for k, v in (fields or {}).items():
         if k in headers:
             col = headers.index(k) + 1
-            updates.append((row, col, "" if v is None else str(v)))
+            updates.append((row_idx, col, "" if v is None else str(v)))
 
     if not updates:
         return
 
-    payload = [{"range": f"{_col_letter(c)}{r}", "values": [[val]]} for (r, c, val) in updates]
-    ws.batch_update(payload)
+    data = [{"range": f"{_col_letter(c)}{r}", "values": [[val]]} for (r, c, val) in updates]
+    ws.batch_update(data)
+    _bump_rev("cases")  # invalida cache
 
 
 # -----------------------------
@@ -372,46 +335,12 @@ def add_vehicle(
     description: str = "",
     source: str = "vin_text",
 ) -> str:
-    """
-    ✅ Cambio clave:
-    - Si vienen vacíos brand/model/year/etc, decodifica VIN aquí mismo y llena campos antes de guardar.
-    - Así no dependemos de que el UI/handler pase los campos.
-    """
     init_db()
     v = normalize_vin(vin)
     if not is_valid_vin(v) or len(v) != 17:
         raise ValueError("VIN inválido. Debe tener 17 caracteres y no incluir I/O/Q.")
     if _vin_exists_global(v):
         raise ValueError("Este VIN ya existe en el sistema (no se puede duplicar).")
-
-    # 1) si faltan campos, intenta decode
-    needs_decode = not any([
-        _clean(brand), _clean(model), _clean(year),
-        _clean(trim), _clean(engine), _clean(vehicle_type),
-        _clean(body_class), _clean(plant_country),
-        _clean(gvwr), _clean(curb_weight),
-    ])
-
-    decoded: Dict[str, Any] = {}
-    if needs_decode:
-        decoded = decode_vin(v) or {}
-
-        # Solo llenamos si decoded trae algo útil
-        if decoded.get("source") == "nhtsa" or decoded.get("brand") or decoded.get("model") or decoded.get("year"):
-            brand = _clean(brand) or _clean(decoded.get("brand"))
-            model = _clean(model) or _clean(decoded.get("model"))
-            year = _clean(year) or _clean(decoded.get("year"))
-            trim = _clean(trim) or _clean(decoded.get("trim"))
-            engine = _clean(engine) or _clean(decoded.get("engine"))
-            vehicle_type = _clean(vehicle_type) or _clean(decoded.get("vehicle_type"))
-            body_class = _clean(body_class) or _clean(decoded.get("body_class"))
-            plant_country = _clean(plant_country) or _clean(decoded.get("plant_country"))
-            gvwr = _clean(gvwr) or _clean(decoded.get("gvwr"))
-            curb_weight = _clean(curb_weight) or _clean(decoded.get("curb_weight"))
-
-            # Fuente: respeta si caller manda una fuente específica, si no usa la del decoder
-            if source in ("vin_text", "", None):
-                source = _clean(decoded.get("source")) or "vin_text"
 
     ws = _ws("vehicles")
     records = ws.get_all_records()
@@ -420,12 +349,9 @@ def add_vehicle(
     now = _now_iso()
 
     row = [
-        vehicle_id, case_id, v,
-        _clean(brand), _clean(model), _clean(year),
-        _clean(trim), _clean(engine), _clean(vehicle_type), _clean(body_class), _clean(plant_country),
-        _clean(gvwr), _clean(curb_weight),
-        _clean(weight), _clean(value), _clean(description),
-        _clean(source), now
+        vehicle_id, case_id, v, brand, model, year,
+        trim, engine, vehicle_type, body_class, plant_country,
+        gvwr, curb_weight, weight, value, description, source, now
     ]
     _append("vehicles", row)
     return vehicle_id
@@ -495,7 +421,7 @@ def add_article(
 
 
 # -----------------------------
-# DOCUMENTS (a nivel trámite)
+# DOCUMENTS
 # -----------------------------
 def list_documents(case_id: str) -> pd.DataFrame:
     init_db()
