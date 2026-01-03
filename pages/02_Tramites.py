@@ -26,7 +26,7 @@ from transit_core.ids import next_case_id
 from transit_core.validators import normalize_vin, is_valid_vin
 from transit_core.vin_decode import decode_vin
 
-from transit_core.pdf_builder import build_case_summary_pdf_bytes  # ✅ nuevo (abajo te lo dejo)
+from transit_core.pdf_builder import build_case_summary_pdf_bytes  # ✅
 
 
 st.set_page_config(page_title="Trámites", layout="wide")
@@ -150,6 +150,27 @@ def _build_article_description(d: dict) -> str:
     return " | ".join(parts).strip()
 
 
+def _apply_vin_decode_to_fields(case_id: str, decoded: dict) -> None:
+    """
+    ✅ CLAVE: Streamlit no actualiza inputs por 'value=' si ya existe 'key'.
+    Por eso debemos setear st.session_state[...] explícitamente.
+    """
+    def set_if_empty(k: str, v: str) -> None:
+        if _safe(st.session_state.get(k, "")) == "":
+            st.session_state[k] = _safe(v)
+
+    set_if_empty(f"veh_brand_{case_id}", decoded.get("brand",""))
+    set_if_empty(f"veh_model_{case_id}", decoded.get("model",""))
+    set_if_empty(f"veh_year_{case_id}", decoded.get("year",""))
+    set_if_empty(f"veh_trim_{case_id}", decoded.get("trim",""))
+    set_if_empty(f"veh_engine_{case_id}", decoded.get("engine",""))
+    set_if_empty(f"veh_vtype_{case_id}", decoded.get("vehicle_type",""))
+    set_if_empty(f"veh_body_{case_id}", decoded.get("body_class",""))
+    set_if_empty(f"veh_plant_{case_id}", decoded.get("plant_country",""))
+    set_if_empty(f"veh_gvwr_{case_id}", decoded.get("gvwr",""))
+    set_if_empty(f"veh_curb_{case_id}", decoded.get("curb_weight",""))
+
+
 # ----------------------------
 # Tabs
 # ----------------------------
@@ -192,7 +213,6 @@ with tab_create:
 
             folder_name = f"{case_id_new} - {client_name}".strip()
 
-            # ✅ script crea UNA carpeta (sin subcarpetas) — asumiendo que ya ajustaste el Apps Script
             res = create_case_folder_via_script(case_id=case_id_new, folder_name=folder_name)
             drive_folder_id = res["folder_id"]
 
@@ -277,17 +297,19 @@ with tab_manage:
     drive_folder_id = str(case.get("drive_folder_id",""))
     client_id = str(case.get("client_id",""))
 
+    # client dict (para PDF)
+    client = {}
     client_name = ""
     if not clients_df.empty:
         m = clients_df[clients_df["client_id"].astype(str) == client_id]
         if not m.empty:
-            client_name = str(m.iloc[0].get("name","")).strip()
+            client = m.iloc[0].to_dict()
+            client_name = str(client.get("name","")).strip()
 
     vehicles_df = list_vehicles(case_id=case_id).fillna("")
     articles_df = list_articles(case_id=case_id).fillna("")
     docs_df = list_documents(case_id).fillna("")
 
-    # ✅ RESUMEN ARRIBA
     st.markdown("### 📌 Resumen del trámite")
     st.write(f"**Trámite:** {case_id}")
     st.write(f"**Cliente:** {client_name}  |  **Estatus:** {case_status}")
@@ -296,14 +318,23 @@ with tab_manage:
 
     st.divider()
 
-    # ✅ ACORDEONES (como te gustaba)
+    # ✅ ACORDEONES
     with st.expander("🚗 Vehículos (agregar / ver)", expanded=True):
-        st.caption("Dicta el VIN claramente o pégalo. Luego confirma y consulta.")
+        st.caption("Dicta el VIN claramente o pégalo. Luego consulta y confirma antes de guardar.")
 
         vin_text_key = f"vin_text_{case_id}"
         vin_decoded_key = f"vin_decoded_{case_id}"
         st.session_state.setdefault(vin_text_key, "")
         st.session_state.setdefault(vin_decoded_key, {})
+
+        # ✅ Inicializa keys de los campos (evita comportamiento raro con value=)
+        for k in [
+            f"veh_brand_{case_id}", f"veh_model_{case_id}", f"veh_year_{case_id}",
+            f"veh_trim_{case_id}", f"veh_engine_{case_id}", f"veh_vtype_{case_id}",
+            f"veh_body_{case_id}", f"veh_plant_{case_id}", f"veh_gvwr_{case_id}",
+            f"veh_curb_{case_id}", f"veh_weight_{case_id}", f"veh_desc_{case_id}",
+        ]:
+            st.session_state.setdefault(k, "")
 
         vin_text = st.text_input("VIN", key=vin_text_key)
         vin_norm = normalize_vin(vin_text)
@@ -325,7 +356,11 @@ with tab_manage:
                 st.session_state[vin_decoded_key] = {}
             else:
                 st.session_state[vin_decoded_key] = out
-                st.success("✅ Info consultada. Revisa antes de guardar.")
+
+                # ✅ CLAVE: aplica a los inputs (session_state) para que se vean en recuadros
+                _apply_vin_decode_to_fields(case_id, out)
+
+                st.success("✅ Info consultada y aplicada a campos. Revisa antes de guardar.")
 
         decoded = st.session_state.get(vin_decoded_key, {}) or {}
         with st.expander("🧪 Debug decoder", expanded=False):
@@ -333,35 +368,35 @@ with tab_manage:
 
         c1, c2, c3 = st.columns(3)
         with c1:
-            brand = st.text_input("Marca", value=str(decoded.get("brand","") or ""), key=f"veh_brand_{case_id}")
+            brand = st.text_input("Marca", key=f"veh_brand_{case_id}")
         with c2:
-            model = st.text_input("Modelo", value=str(decoded.get("model","") or ""), key=f"veh_model_{case_id}")
+            model = st.text_input("Modelo", key=f"veh_model_{case_id}")
         with c3:
-            year = st.text_input("Año", value=str(decoded.get("year","") or ""), key=f"veh_year_{case_id}")
+            year = st.text_input("Año", key=f"veh_year_{case_id}")
 
         c4, c5, c6 = st.columns(3)
         with c4:
-            trim = st.text_input("Trim (opcional)", value=str(decoded.get("trim","") or ""), key=f"veh_trim_{case_id}")
+            trim = st.text_input("Trim (opcional)", key=f"veh_trim_{case_id}")
         with c5:
-            engine = st.text_input("Engine (opcional)", value=str(decoded.get("engine","") or ""), key=f"veh_engine_{case_id}")
+            engine = st.text_input("Engine (opcional)", key=f"veh_engine_{case_id}")
         with c6:
-            vehicle_type = st.text_input("Vehicle type (opcional)", value=str(decoded.get("vehicle_type","") or ""), key=f"veh_vtype_{case_id}")
+            vehicle_type = st.text_input("Vehicle type (opcional)", key=f"veh_vtype_{case_id}")
 
         c7, c8, c9 = st.columns(3)
         with c7:
-            body_class = st.text_input("Body class (opcional)", value=str(decoded.get("body_class","") or ""), key=f"veh_body_{case_id}")
+            body_class = st.text_input("Body class (opcional)", key=f"veh_body_{case_id}")
         with c8:
-            plant_country = st.text_input("Plant country (opcional)", value=str(decoded.get("plant_country","") or ""), key=f"veh_plant_{case_id}")
+            plant_country = st.text_input("Plant country (opcional)", key=f"veh_plant_{case_id}")
         with c9:
-            gvwr = st.text_input("GVWR (opcional)", value=str(decoded.get("gvwr","") or ""), key=f"veh_gvwr_{case_id}")
+            gvwr = st.text_input("GVWR (opcional)", key=f"veh_gvwr_{case_id}")
 
         c10, c11 = st.columns(2)
         with c10:
-            curb_weight = st.text_input("Curb weight (opcional)", value=str(decoded.get("curb_weight","") or ""), key=f"veh_curb_{case_id}")
+            curb_weight = st.text_input("Curb weight (opcional)", key=f"veh_curb_{case_id}")
         with c11:
-            weight_opt = st.text_input("Peso (opcional)", value="", key=f"veh_weight_{case_id}")
+            weight_opt = st.text_input("Peso (opcional)", key=f"veh_weight_{case_id}")
 
-        description = st.text_area("Descripción (opcional)", value="", height=60, key=f"veh_desc_{case_id}")
+        description = st.text_area("Descripción (opcional)", height=60, key=f"veh_desc_{case_id}")
 
         save_ok = st.checkbox("✅ Confirmo que VIN + datos están listos para guardar", key=f"veh_save_ok_{case_id}")
 
@@ -386,12 +421,22 @@ with tab_manage:
                     weight=weight_opt,
                     value="0",
                     description=description,
-                    source="vin_text",
+                    source="ui_form",
                 )
 
                 st.success("✅ Vehículo guardado correctamente.")
+
+                # Limpieza para siguiente vehículo
                 st.session_state[vin_text_key] = ""
                 st.session_state[vin_decoded_key] = {}
+                for k in [
+                    f"veh_brand_{case_id}", f"veh_model_{case_id}", f"veh_year_{case_id}",
+                    f"veh_trim_{case_id}", f"veh_engine_{case_id}", f"veh_vtype_{case_id}",
+                    f"veh_body_{case_id}", f"veh_plant_{case_id}", f"veh_gvwr_{case_id}",
+                    f"veh_curb_{case_id}", f"veh_weight_{case_id}", f"veh_desc_{case_id}",
+                ]:
+                    st.session_state[k] = ""
+
                 st.rerun()
             except Exception as e:
                 st.error(f"Error guardando vehículo: {type(e).__name__}: {e}")
@@ -472,7 +517,6 @@ with tab_manage:
         }
         desc_preview = _build_article_description(d)
 
-        # ✅ VISUAL: ahora sí se ve la descripción automática en pantalla
         st.text_area("Descripción (automática)", value=desc_preview, height=80, disabled=True, key=f"desc_preview_{case_id}")
 
         ok = st.checkbox("✅ Confirmo que el artículo está correcto antes de guardar", key=f"art_ok_{case_id}")
@@ -589,9 +633,11 @@ with tab_manage:
         if st.button("Generar PDF y guardar en carpeta", type="primary", disabled=not can_generate, key=f"gen_pdf_{case_id}"):
             try:
                 case_row = get_case(case_id) or {}
+
+                # ✅ FIX: build_case_summary_pdf_bytes espera client dict, no client_name suelto
                 pdf_bytes = build_case_summary_pdf_bytes(
                     case=case_row,
-                    client_name=client_name,
+                    client=client or {"name": client_name},
                     vehicles_df=vdf,
                     articles_df=adf,
                     documents_df=ddf,
@@ -604,7 +650,6 @@ with tab_manage:
                     mime_type="application/pdf",
                 )
 
-                # registrar como documento tipo OTRO
                 add_document(
                     case_id=case_id,
                     drive_file_id=up.get("file_id",""),
