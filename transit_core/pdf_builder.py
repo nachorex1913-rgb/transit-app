@@ -3,14 +3,13 @@ from __future__ import annotations
 
 from io import BytesIO
 from datetime import datetime
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional
 
 import pandas as pd
 
 from reportlab.lib.pagesizes import LETTER
 from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
-from reportlab.pdfbase import pdfmetrics
 
 
 def _safe(x: Any) -> str:
@@ -21,44 +20,47 @@ def _ts() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _wrap_lines(text: str, font_name: str, font_size: int, max_width: float) -> List[str]:
+def _looks_like_drive_id(s: str) -> bool:
+    s = (s or "").strip()
+    if len(s) < 18:
+        return False
+    # Drive id típico: letras/números/guiones/guion bajo
+    import re
+    return bool(re.fullmatch(r"[A-Za-z0-9_\-]+", s))
+
+
+def _doc_type_clean(row: dict) -> str:
     """
-    Wrap simple por ancho en puntos para ReportLab.
+    Queremos imprimir SIEMPRE el tipo humano (ID_CLIENTE, FACTURA_VEHICULO, etc).
+    Si la hoja quedó “corrida” y doc_type trae el drive id, intentamos corregir.
     """
-    t = _safe(text)
-    if not t:
-        return [""]
+    dt = _safe(row.get("doc_type"))
+    dfid = _safe(row.get("drive_file_id"))
 
-    words = t.split()
-    lines: List[str] = []
-    cur = ""
+    # Si doc_type parece drive id y drive_file_id NO parece drive id => asumimos que drive_file_id trae el tipo
+    if _looks_like_drive_id(dt) and dfid and (not _looks_like_drive_id(dfid)):
+        return dfid
 
-    for w in words:
-        candidate = w if not cur else f"{cur} {w}"
-        if pdfmetrics.stringWidth(candidate, font_name, font_size) <= max_width:
-            cur = candidate
-        else:
-            if cur:
-                lines.append(cur)
-            cur = w
+    # Si doc_type está vacío pero drive_file_id trae algo legible
+    if not dt and dfid and (not _looks_like_drive_id(dfid)):
+        return dfid
 
-    if cur:
-        lines.append(cur)
-    return lines if lines else [""]
+    # Normal
+    return dt or "OTRO"
 
 
 def build_case_summary_pdf_bytes(
     case: Dict[str, Any],
-    client: Dict[str, Any],
-    vehicles_df: Optional[pd.DataFrame],
-    articles_df: Optional[pd.DataFrame],
-    documents_df: Optional[pd.DataFrame],
+    client: Optional[Dict[str, Any]] = None,
+    vehicles_df: Optional[pd.DataFrame] = None,
+    articles_df: Optional[pd.DataFrame] = None,
+    documents_df: Optional[pd.DataFrame] = None,
 ) -> bytes:
     """
-    PDF resumen estilo aduana.
-    - Vehículos: numerados + campos principales
-    - Artículos: numerados + SOLO descripción (sin repetir)
-    - Documentos: numerados + doc_type + file_name (wrap)
+    Genera PDF (bytes) con el resumen del trámite en un formato tipo “aduana”.
+    - vehicles_df: vehículos del case
+    - articles_df: artículos del case
+    - documents_df: documentos del case
     """
 
     buf = BytesIO()
@@ -67,16 +69,8 @@ def build_case_summary_pdf_bytes(
 
     left = 0.75 * inch
     right = width - 0.75 * inch
-    usable_w = right - left
-
     y = height - 0.75 * inch
-    line_h = 13
-
-    def ensure_space(min_y=1.0 * inch):
-        nonlocal y
-        if y < min_y:
-            c.showPage()
-            y = height - 0.75 * inch
+    line_h = 14
 
     def hr():
         nonlocal y
@@ -84,33 +78,28 @@ def build_case_summary_pdf_bytes(
         c.line(left, y, right, y)
         y -= 14
 
-    def write_line(text: str, size=10, bold=False, extra_space=0):
+    def ensure_space(min_y=1.0 * inch):
+        nonlocal y
+        if y < min_y:
+            c.showPage()
+            y = height - 0.75 * inch
+
+    def write(text: str, size=10, bold=False, extra_space=0):
         nonlocal y
         ensure_space()
         c.setFont("Helvetica-Bold" if bold else "Helvetica", size)
         c.drawString(left, y, text)
         y -= (line_h + extra_space)
 
-    def write_wrapped(text: str, size=10, bold=False, indent=0):
-        nonlocal y
-        font = "Helvetica-Bold" if bold else "Helvetica"
-        c.setFont(font, size)
-        max_w = usable_w - indent
-        lines = _wrap_lines(text, font, size, max_w)
-        for ln in lines:
-            ensure_space()
-            c.drawString(left + indent, y, ln)
-            y -= line_h
-
     # -------------------------
     # Header
     # -------------------------
     case_id = _safe(case.get("case_id"))
-    client_name = _safe(client.get("name"))
+    client_name = _safe((client or {}).get("name"))
 
-    write_line("RESUMEN DEL TRÁMITE", size=14, bold=True, extra_space=4)
-    write_line(f"Trámite: {case_id}")
-    write_line(f"Cliente: {client_name}")
+    write("RESUMEN DEL TRÁMITE", size=14, bold=True, extra_space=4)
+    write(f"Trámite: {case_id}")
+    write(f"Cliente: {client_name}")
 
     origin = _safe(case.get("origin"))
     destination = _safe(case.get("destination"))
@@ -118,119 +107,157 @@ def build_case_summary_pdf_bytes(
     created_at = _safe(case.get("created_at"))
     updated_at = _safe(case.get("updated_at"))
 
-    write_line(f"Origen: {origin}    Destino: {destination}    Estatus: {status}")
-    write_line(f"Generado: {_ts()}    Creado: {created_at}    Actualizado: {updated_at}")
+    write(f"Origen: {origin}    Destino: {destination}    Estatus: {status}")
+    write(f"Generado: {_ts()}    Creado: {created_at}    Actualizado: {updated_at}")
 
     hr()
 
     # -------------------------
-    # 1) Vehículos
+    # 1) Vehículos  (NO TOCAR)
     # -------------------------
-    write_line("1) Vehículos", bold=True, size=12, extra_space=2)
+    write("1) Vehículos", bold=True, size=12, extra_space=2)
 
     if vehicles_df is None or vehicles_df.empty:
-        write_line("(sin vehículos)")
+        write("(sin vehículos)")
     else:
-        vdf = vehicles_df.copy().fillna("").reset_index(drop=True)
+        vdf = vehicles_df.copy().fillna("")
+        vdf = vdf.reset_index(drop=True)
+
         for i, row in vdf.iterrows():
             ensure_space(1.25 * inch)
             no = i + 1
 
-            vin = _safe(row.get("vin"))
+            vin = _safe(row.get("unique_key"))
             brand = _safe(row.get("brand"))
             model = _safe(row.get("model"))
             year = _safe(row.get("year"))
-            trim = _safe(row.get("trim"))
-            engine = _safe(row.get("engine"))
-            vtype = _safe(row.get("vehicle_type"))
-            body = _safe(row.get("body_class"))
-            plant = _safe(row.get("plant_country"))
-            gvwr = _safe(row.get("gvwr"))
-            peso = _safe(row.get("weight"))
             desc = _safe(row.get("description"))
+            source = _safe(row.get("source"))
             created_item = _safe(row.get("created_at"))
 
-            write_line(f"Vehículo #{no}: VIN: {vin}", bold=True)
-            write_line(f"Marca/Modelo/Año: {brand} {model} {year}".strip())
+            trim = _safe(row.get("trim")) if "trim" in vdf.columns else ""
+            engine = _safe(row.get("engine")) if "engine" in vdf.columns else ""
+            vtype = _safe(row.get("vehicle_type")) if "vehicle_type" in vdf.columns else ""
+            body = _safe(row.get("body_class")) if "body_class" in vdf.columns else ""
+            plant = _safe(row.get("plant_country")) if "plant_country" in vdf.columns else ""
+            gvwr = _safe(row.get("gvwr")) if "gvwr" in vdf.columns else ""
+            curb = _safe(row.get("curb_weight")) if "curb_weight" in vdf.columns else ""
+            peso = _safe(row.get("weight"))
 
-            if trim: write_line(f"Trim: {trim}")
-            if engine: write_line(f"Motor: {engine}")
-            if vtype: write_line(f"Tipo: {vtype}")
-            if body: write_line(f"Carrocería: {body}")
-            if plant: write_line(f"País planta: {plant}")
-            if gvwr: write_wrapped(f"GVWR: {gvwr}", size=10, indent=0)
-            if peso: write_line(f"Peso (opcional): {peso}")
-
+            write(f"Vehículo #{no}: VIN: {vin}", bold=True)
+            write(f"Marca/Modelo/Año: {brand} {model} {year}")
+            if trim:
+                write(f"Trim: {trim}")
+            if engine:
+                write(f"Motor: {engine}")
+            if vtype:
+                write(f"Tipo: {vtype}")
+            if body:
+                write(f"Carrocería: {body}")
+            if plant:
+                write(f"País planta: {plant}")
+            if gvwr:
+                write(f"GVWR: {gvwr}")
+            if curb:
+                write(f"Curb weight: {curb}")
+            if peso:
+                write(f"Peso (opcional): {peso}")
             if desc:
-                write_wrapped(f"Nota/Descripción: {desc}", size=10, indent=0)
-
+                write(f"Nota/Descripción: {desc}")
+            if source:
+                write(f"Fuente: {source}")
             if created_item:
-                write_line(f"Registrado: {created_item}")
+                write(f"Registrado: {created_item}")
 
             y -= 4
 
     hr()
 
     # -------------------------
-    # 2) Artículos / Items
+    # 2) Artículos / Items  (NO TOCAR)
     # -------------------------
-    write_line("2) Artículos / Items", bold=True, size=12, extra_space=2)
+    write("2) Artículos / Items", bold=True, size=12, extra_space=2)
 
     if articles_df is None or articles_df.empty:
-        write_line("(sin artículos)")
+        write("(sin artículos)")
     else:
-        adf = articles_df.copy().fillna("").reset_index(drop=True)
+        adf = articles_df.copy().fillna("")
+        adf = adf.reset_index(drop=True)
+
         for i, row in adf.iterrows():
             ensure_space(1.25 * inch)
             no = i + 1
 
-            seq = _safe(row.get("seq"))
+            uk = _safe(row.get("unique_key"))
+            brand = _safe(row.get("brand"))
+            model = _safe(row.get("model"))
+            qty = _safe(row.get("quantity"))
+            weight = _safe(row.get("weight"))
+            value = _safe(row.get("value"))
             desc = _safe(row.get("description"))
             created_item = _safe(row.get("created_at"))
 
-            # ✅ Identificación clara
-            write_line(f"Artículo #{no}: {seq}".strip(), bold=True)
-
-            # ✅ SOLO descripción (sin repetir)
+            write(f"Item #{no}: {uk}", bold=True)
             if desc:
-                write_wrapped(f"Descripción: {desc}", size=10, indent=0)
+                write(f"Descripción: {desc}")
             else:
-                write_line("Descripción: (sin descripción)")
+                write("Descripción: (sin descripción)")
+
+            line = []
+            if brand:
+                line.append(f"Marca: {brand}")
+            if model:
+                line.append(f"Modelo: {model}")
+            if qty:
+                line.append(f"Cantidad: {qty}")
+            if weight:
+                line.append(f"Peso: {weight}")
+            if value:
+                line.append(f"Valor: {value}")
+
+            if line:
+                write(" | ".join(line))
 
             if created_item:
-                write_line(f"Registrado: {created_item}")
+                write(f"Registrado: {created_item}")
 
             y -= 4
 
     hr()
 
     # -------------------------
-    # 3) Documentos del trámite
+    # 3) Documentos del trámite  ✅ (CAMBIO AQUÍ)
+    # - NO mostrar Drive id como “tipo”
+    # - NO imprimir drive_file_id como línea (link/id)
     # -------------------------
-    write_line("3) Documentos del trámite", bold=True, size=12, extra_space=2)
+    write("3) Documentos del trámite", bold=True, size=12, extra_space=2)
 
     if documents_df is None or documents_df.empty:
-        write_line("(sin documentos)")
+        write("(sin documentos)")
     else:
-        ddf = documents_df.copy().fillna("").reset_index(drop=True)
+        ddf = documents_df.copy().fillna("")
+        ddf = ddf.reset_index(drop=True)
+
         for i, row in ddf.iterrows():
             ensure_space(1.25 * inch)
             no = i + 1
 
-            doc_type = _safe(row.get("doc_type"))
-            file_name = _safe(row.get("file_name"))
-            uploaded_at = _safe(row.get("uploaded_at"))
-            drive_file_id = _safe(row.get("drive_file_id"))
+            row_dict = row.to_dict() if hasattr(row, "to_dict") else dict(row)
 
-            # ✅ Identifica tipo explícito: ID_CLIENTE, etc.
-            write_wrapped(f"Documento #{no}: [{doc_type}] {file_name}", size=10, bold=True, indent=0)
+            doc_type = _doc_type_clean(row_dict)  # ✅ tipo humano
+            file_name = _safe(row_dict.get("file_name"))
+            uploaded_at = _safe(row_dict.get("uploaded_at"))
+
+            # Formato: Documento #n: [TIPO] archivo   fecha
+            title = f"Documento #{no}: [{doc_type}] {file_name}".strip()
+            write(title, bold=True)
+
             if uploaded_at:
-                write_line(f"Subido: {uploaded_at}")
-            if drive_file_id:
-                write_wrapped(f"Drive file_id: {drive_file_id}", size=9, indent=0)
+                write(f"Subido: {uploaded_at}")
 
             y -= 2
 
     c.showPage()
     c.save()
+
     return buf.getvalue()
