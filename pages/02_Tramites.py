@@ -7,6 +7,7 @@ from datetime import datetime
 
 from transit_core.gsheets_db import (
     list_clients,
+    get_client,  # ✅ FIX: lo necesitamos para el PDF builder
     list_cases,
     get_case,
     create_case,
@@ -26,7 +27,7 @@ from transit_core.ids import next_case_id
 from transit_core.validators import normalize_vin, is_valid_vin
 from transit_core.vin_decode import decode_vin
 
-from transit_core.pdf_builder import build_case_summary_pdf_bytes  # NO tocamos PDF en esta fase
+from transit_core.pdf_builder import build_case_summary_pdf_bytes
 
 
 st.set_page_config(page_title="Trámites", layout="wide")
@@ -354,7 +355,7 @@ with tab_manage:
         if not m.empty:
             client_name = str(m.iloc[0].get("name", "")).strip()
 
-    # Cargar data una sola vez (evita repetición y lentitud)
+    # Cargar data una sola vez
     vehicles_df = list_vehicles(case_id=case_id).fillna("")
     articles_df = list_articles(case_id=case_id).fillna("")
     docs_df = list_documents(case_id).fillna("")
@@ -400,9 +401,8 @@ with tab_manage:
     st.markdown("<div class='section-title'>Resumen completo (registros actuales)</div>", unsafe_allow_html=True)
 
     # -------------------------
-    # RESUMEN EN TABLAS (claro, ejecutivo)
+    # RESUMEN EN TABLAS
     # -------------------------
-    # Vehículos
     st.markdown("#### Vehículos")
     if vehicles_df.empty:
         st.info("Sin vehículos.")
@@ -412,18 +412,15 @@ with tab_manage:
         cols = [c for c in ["#", "vin", "brand", "model", "year", "trim", "engine", "vehicle_type", "body_class", "plant_country", "gvwr", "weight", "description", "created_at"] if c in v.columns]
         st.dataframe(v[cols], use_container_width=True, hide_index=True)
 
-    # Artículos
     st.markdown("#### Artículos")
     if articles_df.empty:
         st.info("Sin artículos.")
     else:
         a = articles_df.copy().fillna("").reset_index(drop=True)
         a.insert(0, "#", range(1, len(a) + 1))
-        # Para aduana: no repetir todo, la descripción ya manda
         cols = [c for c in ["#", "seq", "description", "quantity", "weight", "value", "is_vehicle_part", "parent_vin", "created_at"] if c in a.columns]
         st.dataframe(a[cols], use_container_width=True, hide_index=True)
 
-    # Documentos
     st.markdown("#### Documentos")
     if docs_df.empty:
         st.info("Sin documentos.")
@@ -436,12 +433,11 @@ with tab_manage:
     st.divider()
 
     # =========================================================
-    # ACORDEONES OPERATIVOS (se mantienen)
+    # ACORDEONES OPERATIVOS
     # =========================================================
     with st.expander("🚗 Vehículos (agregar / ver)", expanded=True):
         st.caption("Pega o dicta el VIN. Consulta y luego guarda.")
 
-        # Nonce para reset seguro (evita StreamlitAPIException)
         vin_nonce_key = f"vin_nonce_{case_id}"
         if vin_nonce_key not in st.session_state:
             st.session_state[vin_nonce_key] = 0
@@ -470,7 +466,6 @@ with tab_manage:
             else:
                 st.session_state[vin_decoded_key] = out
 
-                # ✅ Autollenado REAL: escribir en session_state de los widgets
                 st.session_state[f"veh_brand_{case_id}"] = str(out.get("brand", "") or "")
                 st.session_state[f"veh_model_{case_id}"] = str(out.get("model", "") or "")
                 st.session_state[f"veh_year_{case_id}"] = str(out.get("year", "") or "")
@@ -481,7 +476,6 @@ with tab_manage:
                 st.session_state[f"veh_plant_{case_id}"] = str(out.get("plant_country", "") or "")
                 st.session_state[f"veh_gvwr_{case_id}"] = str(out.get("gvwr", "") or "")
 
-                # Nota: curb_weight lo guardamos internamente si viene, pero NO lo mostramos
                 st.session_state[f"veh_curb_hidden_{case_id}"] = str(out.get("curb_weight", "") or "")
 
                 st.success("Info consultada. Verifica y guarda.")
@@ -514,7 +508,6 @@ with tab_manage:
         with c9:
             gvwr = st.text_input("GVWR (opcional)", key=f"veh_gvwr_{case_id}")
 
-        # ✅ Quitamos curb weight (no UI)
         curb_weight_hidden = str(st.session_state.get(f"veh_curb_hidden_{case_id}", "") or "")
 
         weight_opt = st.text_input("Peso (opcional)", value="", key=f"veh_weight_{case_id}")
@@ -539,7 +532,7 @@ with tab_manage:
                     body_class=body_class,
                     plant_country=plant_country,
                     gvwr=gvwr,
-                    curb_weight=curb_weight_hidden,  # se guarda si existe, pero no se muestra
+                    curb_weight=curb_weight_hidden,
                     weight=weight_opt,
                     value="0",
                     description=description,
@@ -547,8 +540,6 @@ with tab_manage:
                 )
 
                 st.success("Vehículo guardado correctamente.")
-
-                # ✅ Reset seguro: sube nonce para que el input VIN sea “nuevo”
                 st.session_state[vin_nonce_key] = int(st.session_state[vin_nonce_key]) + 1
                 st.session_state[vin_decoded_key] = {}
                 st.rerun()
@@ -587,9 +578,6 @@ with tab_manage:
             st.session_state[f"ap_{case_id}"] = bool(parsed.get("is_vehicle_part", False))
             st.session_state[f"pv_{case_id}"] = normalize_vin(parsed.get("parent_vin", "") or "")
             st.success("Dictado aplicado.")
-
-        with st.expander("🧪 Debug dictado", expanded=False):
-            st.json(parsed)
 
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -631,8 +619,6 @@ with tab_manage:
             "value": value, "is_vehicle_part": bool(is_part), "parent_vin": parent_vin
         }
         desc_preview = _build_article_description(d)
-
-        # ✅ Visible siempre
         st.text_area("Descripción (automática)", value=desc_preview, height=80, disabled=True)
 
         ok = st.checkbox("Confirmo que el artículo está correcto antes de guardar", key=f"art_ok_{case_id}")
@@ -654,31 +640,9 @@ with tab_manage:
                     source="voice" if _safe(dictation) else "manual",
                 )
                 st.success("Artículo guardado correctamente.")
-
-                st.session_state[dict_key] = ""
-                st.session_state[f"at_{case_id}"] = ""
-                st.session_state[f"ar_{case_id}"] = ""
-                st.session_state[f"ab_{case_id}"] = ""
-                st.session_state[f"am_{case_id}"] = ""
-                st.session_state[f"aw_{case_id}"] = ""
-                st.session_state[f"ac_{case_id}"] = ""
-                st.session_state[f"aq_{case_id}"] = 1
-                st.session_state[f"av_{case_id}"] = ""
-                st.session_state[f"ap_{case_id}"] = False
-                st.session_state[f"pv_{case_id}"] = ""
                 st.rerun()
             except Exception as e:
                 st.error(f"Error guardando artículo: {type(e).__name__}: {e}")
-
-        st.markdown("#### Artículos registrados")
-        adf2 = list_articles(case_id=case_id).fillna("")
-        if adf2.empty:
-            st.info("Aún no hay artículos.")
-        else:
-            ashow = adf2.copy().reset_index(drop=True)
-            ashow.insert(0, "#", range(1, len(ashow) + 1))
-            show_cols = [c for c in ["#", "seq", "description", "quantity", "weight", "value", "created_at"] if c in ashow.columns]
-            st.dataframe(ashow[show_cols], use_container_width=True, hide_index=True)
 
     with st.expander("📎 Documentos del trámite (subir TODO aquí)", expanded=True):
         if not drive_folder_id:
@@ -722,17 +686,6 @@ with tab_manage:
                 except Exception as e:
                     st.error(f"Error subiendo documentos: {type(e).__name__}: {e}")
 
-        st.markdown("#### Documentos registrados")
-        ddf = list_documents(case_id).fillna("")
-        if ddf.empty:
-            st.info("Aún no hay documentos.")
-        else:
-            dshow = ddf.copy().reset_index(drop=True)
-            dshow.insert(0, "#", range(1, len(dshow) + 1))
-            show_cols = [c for c in ["#", "doc_type", "file_name", "uploaded_at"] if c in dshow.columns]
-            st.dataframe(dshow[show_cols], use_container_width=True, hide_index=True)
-
-    # (Validación + PDF + status) se mantiene igual por ahora (NO tocamos PDF)
     with st.expander("✅ Validación + Generar PDF + Marcar Pendiente", expanded=True):
         st.caption("Cuando todo esté completo (vehículos + artículos + documentos), genera el PDF y marca Pendiente.")
 
@@ -745,7 +698,6 @@ with tab_manage:
         st.write(f"- Documentos: {'✅' if not ddf.empty else '❌'}")
 
         ready = st.checkbox("Confirmo que el trámite está completo y listo para enviar", key=f"ready_{case_id}")
-
         can_generate = ready and (not vdf.empty) and (not adf.empty) and (not ddf.empty) and bool(drive_folder_id)
 
         pdf_name = f"TR_{case_id}_{client_name}_RESUMEN_TRAMITE.pdf".replace(" ", "_")
@@ -753,9 +705,12 @@ with tab_manage:
         if st.button("Generar PDF y guardar en carpeta", type="primary", disabled=not can_generate, key=f"gen_pdf_{case_id}"):
             try:
                 case_row = get_case(case_id) or {}
+                client_row = get_client(client_id) or {}  # ✅ FIX
+
+                # ✅ FIX: la función espera `client` (dict), NO `client_name`
                 pdf_bytes = build_case_summary_pdf_bytes(
                     case=case_row,
-                    client_name=client_name,
+                    client=client_row,
                     vehicles_df=vdf,
                     articles_df=adf,
                     documents_df=ddf,
