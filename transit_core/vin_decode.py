@@ -1,11 +1,20 @@
 from __future__ import annotations
 
-from typing import Dict, Any
+from typing import Dict, Any, Optional, Tuple
+import time
+import hashlib
 import requests
+
+from requests.adapters import HTTPAdapter
+
+try:
+    from urllib3.util.retry import Retry
+except Exception:
+    Retry = None  # type: ignore
 
 from .validators import normalize_vin, is_valid_vin
 
-VIN_DECODE_VERSION = "VIN_DECODE_GENERIC_v3_2026-01-02"
+VIN_DECODE_VERSION = "VIN_DECODE_GENERIC_v4_2026-01-03"
 
 _WMI_BRAND = {
     "JHM": "HONDA", "1HG": "HONDA", "2HG": "HONDA", "JH4": "ACURA",
@@ -32,6 +41,97 @@ _YEAR_2010_2039 = {
 }
 
 
+# -------------------------
+# Config “production-friendly”
+# -------------------------
+VPIC_URL = "https://vpic.nhtsa.dot.gov/api/vehicles/decodevinvaluesextended/{vin}?format=json"
+
+CONNECT_TIMEOUT = 5.0
+READ_TIMEOUT = 45.0
+
+RETRIES_TOTAL = 3
+BACKOFF_FACTOR = 0.6
+
+CACHE_TTL_SECONDS = 60 * 60 * 24 * 30  # 30 días
+
+# Circuit breaker: si hay muchos fallos seguidos, no pegues a NHTSA por un rato
+CB_FAIL_THRESHOLD = 5
+CB_OPEN_SECONDS = 120
+
+
+# -------------------------
+# Cache simple en memoria
+# -------------------------
+class _TTLCache:
+    def __init__(self, ttl_seconds: int):
+        self.ttl = ttl_seconds
+        self._data: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
+    def get(self, key: str) -> Optional[Dict[str, Any]]:
+        item = self._data.get(key)
+        if not item:
+            return None
+        ts, val = item
+        if (time.time() - ts) > self.ttl:
+            self._data.pop(key, None)
+            return None
+        return val
+
+    def set(self, key: str, val: Dict[str, Any]) -> None:
+        self._data[key] = (time.time(), val)
+
+
+_cache = _TTLCache(CACHE_TTL_SECONDS)
+
+
+# -------------------------
+# HTTP Session con retries
+# -------------------------
+_session = requests.Session()
+
+if Retry is not None:
+    retry = Retry(
+        total=RETRIES_TOTAL,
+        connect=RETRIES_TOTAL,
+        read=RETRIES_TOTAL,
+        status=RETRIES_TOTAL,
+        backoff_factor=BACKOFF_FACTOR,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    _session.mount("https://", adapter)
+    _session.mount("http://", adapter)
+
+
+# -------------------------
+# Circuit breaker state (simple)
+# -------------------------
+_fail_count = 0
+_break_until_ts = 0.0
+
+
+def _circuit_open() -> bool:
+    return time.time() < _break_until_ts
+
+
+def _trip_circuit() -> None:
+    global _fail_count, _break_until_ts
+    _fail_count += 1
+    if _fail_count >= CB_FAIL_THRESHOLD:
+        _break_until_ts = time.time() + CB_OPEN_SECONDS
+
+
+def _reset_circuit() -> None:
+    global _fail_count, _break_until_ts
+    _fail_count = 0
+    _break_until_ts = 0.0
+
+
+# -------------------------
+# Helpers
+# -------------------------
 def _brand_from_wmi(vin: str) -> str:
     return _WMI_BRAND.get(vin[:3], "")
 
@@ -49,10 +149,6 @@ def _year_candidates(vin: str) -> list[int]:
 
 
 def _as_clean_str(v: Any) -> str:
-    """
-    Convierte cualquier valor a string limpio y seguro.
-    Evita reventar con .strip() en int/float/None.
-    """
     if v is None:
         return ""
     if isinstance(v, str):
@@ -68,12 +164,48 @@ def _first_nonempty(row: dict, keys: list[str]) -> str:
     return ""
 
 
-def _decode_nhtsa(vin: str) -> Dict[str, Any]:
-    url = f"https://vpic.nhtsa.dot.gov/api/vehicles/decodevinvaluesextended/{vin}?format=json"
-    r = requests.get(url, timeout=15)
-    r.raise_for_status()
+def _cache_key(vin: str) -> str:
+    # SHA1 por simplicidad y porque es interno
+    return hashlib.sha1(vin.encode("utf-8")).hexdigest()
 
-    payload = r.json()
+
+# -------------------------
+# NHTSA decode (robusto)
+# -------------------------
+def _decode_nhtsa(vin: str) -> Dict[str, Any]:
+    """
+    Devuelve dict con datos si hay make/model/year,
+    o dict con {"error": ...} si no hay datos útiles.
+    """
+    url = VPIC_URL.format(vin=vin)
+
+    # Circuit breaker: si está abierto, no golpeamos NHTSA
+    if _circuit_open():
+        return {
+            "error": "NHTSA_CIRCUIT_OPEN",
+            "raw_error_text": "Circuit open (fallos repetidos).",
+            "raw_error_code": "",
+        }
+
+    try:
+        r = _session.get(url, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+    except requests.exceptions.Timeout as e:
+        _trip_circuit()
+        return {"error": "NHTSA_TIMEOUT", "raw_error_text": f"{type(e).__name__}: {e}", "raw_error_code": ""}
+    except requests.exceptions.RequestException as e:
+        _trip_circuit()
+        return {"error": "NHTSA_REQUEST_EXCEPTION", "raw_error_text": f"{type(e).__name__}: {e}", "raw_error_code": ""}
+
+    if r.status_code != 200:
+        _trip_circuit()
+        return {"error": f"NHTSA_HTTP_{r.status_code}", "raw_error_text": (r.text or "")[:600], "raw_error_code": ""}
+
+    try:
+        payload = r.json()
+    except Exception as e:
+        _trip_circuit()
+        return {"error": "NHTSA_BAD_JSON", "raw_error_text": f"{type(e).__name__}: {e}", "raw_error_code": ""}
+
     results = payload.get("Results") or []
     row = results[0] if results else {}
 
@@ -86,9 +218,14 @@ def _decode_nhtsa(vin: str) -> Dict[str, Any]:
 
     # Si NO trae nada útil, tratamos como "sin data"
     if not (make or model or year):
+        # Ojo: aquí NO necesariamente es “falla”; puede ser VIN raro o incompleto.
+        # Igual consideramos esto como “sin data”.
+        _trip_circuit()
         return {"error": "NHTSA_NO_DATA", "raw_error_text": err_text, "raw_error_code": err_code}
 
-    # Peso SOLO si NHTSA trae algo (no inventar)
+    # Si llegó aquí, NHTSA respondió con algo útil: cerramos circuito
+    _reset_circuit()
+
     curb_weight = _first_nonempty(row, ["CurbWeight", "CurbWt", "Curb Weight"])
     gvwr = _first_nonempty(row, ["GVWR", "GVWRFrom", "GVWRTo"])
 
@@ -107,11 +244,15 @@ def _decode_nhtsa(vin: str) -> Dict[str, Any]:
     }
 
 
+# -------------------------
+# Public API
+# -------------------------
 def decode_vin(vin: str) -> Dict[str, Any]:
     """
     Pipeline:
-    1) NHTSA vPIC -> si trae make/model/year retorna.
-    2) Fallback offline -> marca por WMI + año por pos 10 (modelo vacío)
+    1) Cache -> si existe, retorna.
+    2) NHTSA vPIC -> si trae make/model/year retorna.
+    3) Fallback offline -> marca por WMI + año por pos 10 (modelo vacío)
     """
     v = normalize_vin(vin)
 
@@ -122,35 +263,42 @@ def decode_vin(vin: str) -> Dict[str, Any]:
     if not is_valid_vin(v):
         return {"error": "VIN inválido (A-Z/0-9, sin I/O/Q)", "version": VIN_DECODE_VERSION}
 
+    # 1) cache
+    ck = _cache_key(v)
+    cached = _cache.get(ck)
+    if cached:
+        return cached
+
     nhtsa_status = ""
     nhtsa_text = ""
     nhtsa_code = ""
 
-    try:
-        out = _decode_nhtsa(v)
-        if not out.get("error"):
-            out["version"] = VIN_DECODE_VERSION
-            return out
+    # 2) NHTSA
+    out = _decode_nhtsa(v)
+    if not out.get("error"):
+        out["version"] = VIN_DECODE_VERSION
+        # cacheamos éxito
+        _cache.set(ck, out)
+        return out
 
-        nhtsa_status = out.get("error", "")
-        nhtsa_text = out.get("raw_error_text", "")
-        nhtsa_code = out.get("raw_error_code", "")
+    nhtsa_status = out.get("error", "")
+    nhtsa_text = out.get("raw_error_text", "")
+    nhtsa_code = out.get("raw_error_code", "")
 
-    except Exception as e:
-        nhtsa_status = f"NHTSA_FAIL: {type(e).__name__}: {e}"
-
-    # OFFLINE fallback
+    # 3) OFFLINE fallback
     brand = _brand_from_wmi(v)
     years = _year_candidates(v)
 
     if not brand and not years:
-        return {
+        final = {
             "error": "NHTSA sin datos y fallback offline sin inferencias. Ingresa manual.",
             "version": VIN_DECODE_VERSION,
             "nhtsa_status": nhtsa_status,
         }
+        # no cacheamos errores definitivos
+        return final
 
-    return {
+    final = {
         "brand": brand,
         "model": "",
         "year": str(years[0]) if years else "",
@@ -170,3 +318,7 @@ def decode_vin(vin: str) -> Dict[str, Any]:
         "nhtsa_error_code": nhtsa_code,
         "version": VIN_DECODE_VERSION,
     }
+
+    # cacheamos fallback para que no esté pegando a NHTSA repetidamente cuando está lento
+    _cache.set(ck, final)
+    return final
